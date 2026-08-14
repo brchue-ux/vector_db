@@ -1,0 +1,19 @@
+# Nothing derived from the captain's transcripts may ever be committed. The
+# index is exactly as sensitive as the corpus itself (report F9).
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
+*.sqlite
+index/
+corpus/
+data/
+*.jsonl
+*.npy
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.coverage
