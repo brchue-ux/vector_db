@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vdb"
+version = "0.1.0"
+description = "Local BM25 retrieval over your own Claude Code history"
+requires-python = ">=3.11"
+dependencies = []          # phase 1 is stdlib-only, on purpose
+
+[project.scripts]
+vdb = "vdb.cli:main"
+
+[tool.setuptools]
+packages = ["vdb"]
