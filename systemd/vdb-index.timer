@@ -1,0 +1,13 @@
+[Unit]
+Description=vdb: keep the history index fresh without anyone running it by hand
+
+[Timer]
+# Shortly after boot/login, then every 15 minutes. A no-op incremental run
+# costs ~0.2s (README "Index"), so this cadence is cheap; Persistent=true
+# catches up on the run(s) missed while the machine was off or asleep.
+OnBootSec=2min
+OnUnitActiveSec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

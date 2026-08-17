@@ -1,0 +1,13 @@
+[Unit]
+Description=vdb: incremental index of the Claude Code history corpus
+# Read-only against ~/.claude; safe to run at any time, including concurrently
+# with other Claude Code sessions.
+
+[Service]
+Type=oneshot
+WorkingDirectory=@REPO_ROOT@
+Environment=PYTHONPATH=@REPO_ROOT@
+ExecStart=@PYTHON@ -m vdb index --quiet
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

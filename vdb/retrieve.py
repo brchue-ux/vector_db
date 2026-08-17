@@ -9,10 +9,20 @@ The seam for that is exactly this module's `Hit` shape and `search()`
 signature - a second retriever returns the same `(chunk_id, rank, score)` and a
 fusion function combines two ranked lists. Nothing more is built for it here.
 
-No confidence gate is applied. Absolute score carries no usable signal
-(AUC 0.551, F6); the rank-1-to-rank-10 margin does (AUC 0.724), so `search()`
-reports that margin as a diagnostic and lets the caller judge. Retrieval is
-never injected automatically (§13.2) - it is asked for.
+No confidence gate is applied - and there is not a strong enough measured
+signal to build one on. Report F6 found absolute similarity carries no usable
+signal (AUC 0.551) and the rank-1-to-rank-10 margin does better (AUC 0.724) -
+but that was measured for a bounded dense cosine score, not for this
+retriever. Re-measured directly for BM25's own unbounded `-bm25()` score (the
+`vdbtray` chunk-granularity harness, reused for this question): AUC(top1
+score) = 0.530, 95% CI [0.480, 0.582] (still no usable signal, same
+conclusion as F6) and AUC(margin) = 0.645, 95% CI [0.598, 0.690] (real, but
+distinctly weaker than the dense 0.724 - the hit and miss margin distributions
+overlap substantially). `search()` reports the margin as a diagnostic and lets
+the caller judge; it is deliberately not thresholded into a verdict, because
+0.645 is not strong enough evidence to hang a hard cutoff on without it
+misfiring often (`vdbqual` O13 remains open). Retrieval is never injected
+automatically (§13.2) - it is asked for.
 """
 
 from __future__ import annotations
@@ -50,19 +60,36 @@ class Hit:
 @dataclass
 class Result:
     query: str
+    k_requested: int = 10
     hits: list[Hit] = field(default_factory=list)
 
     @property
     def margin(self) -> float | None:
-        """Rank-1 to rank-10 score margin - the only signal F6 found usable.
+        """Rank-1 to rank-10 (or rank-1 to the last hit, if fewer) score margin.
 
-        Returned for the caller to look at. It is deliberately not thresholded
-        here: nobody has built or validated that classifier (open question O13).
+        The only signal measured to beat the raw top score - see this module's
+        docstring for the BM25-specific AUC numbers. Returned for the caller to
+        look at; deliberately not thresholded into a verdict, because the
+        measured signal (AUC 0.645) isn't strong enough to hang a hard cutoff
+        on without it misfiring often (open question O13).
         """
         if len(self.hits) < 2:
             return None
         last = self.hits[min(9, len(self.hits) - 1)]
         return round(self.hits[0].score - last.score, 4)
+
+    @property
+    def weak_signal(self) -> bool:
+        """A calibration-free, structural weak-signal flag.
+
+        True when there isn't enough returned material to say anything with
+        confidence: no hits, only one hit (the margin is undefined), or fewer
+        hits than requested (the index has thin coverage for this query). This
+        is deliberately NOT based on a margin or score cutoff - the measured
+        AUC (0.645) isn't strong enough evidence to invent a numeric threshold
+        that would misfire silently. See this module's docstring.
+        """
+        return len(self.hits) < 2 or len(self.hits) < self.k_requested
 
 
 def match_expression(question: str) -> str:
@@ -98,9 +125,20 @@ class BM25Retriever:
         k: int = 10,
         project: str | None = None,
         role: str | None = None,
+        session: str | None = None,
         since: str | None = None,
+        until: str | None = None,
         include_sidechain: bool = True,
     ) -> Result:
+        """Metadata filters narrow the candidate set before BM25 ranks it.
+
+        `project` and `session` are substring matches (a session id is a full
+        UUID nobody types from memory); `role` is exact (`user` / `assistant`
+        / `memory` - the corpus's speaker dimension); `since` / `until` are
+        ISO-8601 timestamp bounds, inclusive. This is the mechanism that makes
+        the tool cheaper than reading a whole conversation - it is load-bearing,
+        not a convenience (§13.1 "the captain's chapter/page/paragraph").
+        """
         where = ["chunks_fts MATCH ?"]
         params: list[object] = [match_expression(question)]
         if project:
@@ -109,9 +147,15 @@ class BM25Retriever:
         if role:
             where.append("c.role = ?")
             params.append(role)
+        if session:
+            where.append("c.session_id LIKE ?")
+            params.append(f"%{session}%")
         if since:
             where.append("c.ts >= ?")
             params.append(since)
+        if until:
+            where.append("c.ts <= ?")
+            params.append(until)
         if not include_sidechain:
             where.append("c.is_sidechain = 0")
         params.append(k)
@@ -142,4 +186,4 @@ class BM25Retriever:
             )
             for i, row in enumerate(self.conn.execute(sql, params), start=1)
         ]
-        return Result(query=question, hits=hits)
+        return Result(query=question, k_requested=k, hits=hits)

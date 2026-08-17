@@ -1,16 +1,26 @@
 # vector_db
 
-Local retrieval over your own Claude Code history: ask a question, get back passages
-from past sessions with enough provenance to go read the rest.
+Local retrieval over your own Claude Code history — **for an agent to call, not a human to
+search.** A Claude Code session invokes `vdb query` mid-task when it decides it needs past
+context, and gets back a handful of short, provenance-tagged passages instead of loading a whole
+conversation. There is deliberately no UI and no visual app here, and none is planned — the
+consumer is an agent, not a human doing his own searching.
 
-**Status: phase 1 shipped.** Ingest, cleaning, message-boundary chunking, a BM25
-keyword index, and an explicit query command. No model, no vectors, no network,
-no dependencies beyond the Python standard library. Phase 2 adds a dense index
-and reciprocal-rank fusion.
+**Status: phase 1 + the agent-facing tool shipped.** Ingest, cleaning, message-boundary
+chunking, a BM25 keyword index, metadata pre-filtering, and a deterministic, agent-callable query
+command with a background indexer. No model, no vectors, no network, no dependencies beyond the
+Python standard library. Phase 2 adds a dense index and reciprocal-rank fusion.
 
-Everything here implements the retrieval-quality study (`vdbqual` report §13),
-which measured 380 real queries against this corpus. The design decisions below
-are its findings, not preferences.
+Everything here implements the retrieval-quality study (`vdbqual` report §13) plus the follow-up
+`vdbtray` chunk-granularity experiment that set the split threshold below. Both measured real
+queries against this corpus with confidence intervals; the design decisions below are their
+findings, not preferences.
+
+**How reliable this actually is, stated plainly:** on the fullest-scale measurement available
+(`vdbqual` §11.7), the best configuration finds a labelled correct passage in the top 10 for
+roughly **three queries in four**. It cannot reliably tell you when it has found nothing (see
+"Retrieval is asked for, never injected" below) — a returned passage is a candidate to read and
+judge, not a verified answer. Read the passages; don't act on the ranking alone.
 
 ## What it does
 
@@ -28,11 +38,16 @@ are its findings, not preferences.
   inside a launch brief is the best summary of that session that exists
   (§7, §11.5).
 * **Chunks one message per chunk**, splitting long messages at paragraph
-  boundaries near 1,800 chars, no overlap, nothing in the chunk but the
-  message's own text. This is the single largest measured effect in the study:
-  +0.085 recall@10 over 600-char windows *at matched chunk size*
-  (CI [+0.044, +0.126]). Metadata headers cost −0.041; neighbouring context
-  halves cross-session recall (§11.1–§11.3).
+  boundaries near 1,000 chars, no overlap, nothing in the chunk but the
+  message's own text. Message-boundary chunking itself is the single largest
+  measured effect in the study: +0.085 recall@10 over 600-char windows *at
+  matched chunk size* (CI [+0.044, +0.126]). Metadata headers cost −0.041;
+  neighbouring context halves cross-session recall (§11.1–§11.3). The 1,000
+  threshold is a separate, later finding (`vdbtray` chunk-granularity
+  experiment, outside this repo) — see `vdb/chunk.py`'s docstring: it's the
+  lowest threshold with no measured recall/MRR cost on any query family, and
+  it nearly halves the size of the chunk that answers a query versus the
+  untested 1,800 default `vdbqual` shipped with.
 * **Redacts secret-shaped strings on ingest** — private keys, cloud and API
   tokens, JWTs, bearer headers, OAuth callback codes, long high-entropy tokens
   (§13.1, F9).
@@ -67,26 +82,101 @@ Override with `--db` or `$VDB_DB`.
 > The secret filter reduces the exposure; it does not eliminate it (open
 > question O14 leaves its false-negative rate on this material unmeasured).
 
-## Query
+## Query — for an agent to call
 
 ```sh
 python -m vdb query "why did we pick sqlite over duckdb"
 python -m vdb query "flaky websocket reconnect" -k 5 --full
-python -m vdb query "auth redesign" --project firstmate --since 2026-06-01
-python -m vdb query "auth redesign" --json          # for programmatic callers
+python -m vdb query "auth redesign" --project firstmate --since 2026-06-01 --until 2026-07-01
+python -m vdb query "auth redesign" --session a3e6769e --role user
+python -m vdb query "auth redesign" --json          # for programmatic callers — use this
 ```
 
-Each hit carries project, role, timestamp, session id and source file, so a
-passage can always be traced back to the session it came from.
+### Filters — narrow before searching, not after
 
-Retrieval is **asked for, never injected.** The study's load-bearing negative
-finding is that this system cannot tell when it has found nothing: the top hit's
-score is statistically indistinguishable whether or not the answer is in the
-corpus (AUC 0.551, F6). Anything that pastes top-k into every session will paste
-confident nonsense a large fraction of the time with no signal that it did. The
-rank-1-to-rank-10 margin does carry signal (AUC 0.724) and is printed as a
-diagnostic — it is deliberately not thresholded, because nobody has built or
-validated that classifier yet (O13).
+The corpus carries the captain's own "chapter/page/paragraph" as structure; filtering on it is
+what makes this cheaper than reading a whole conversation, so it runs *before* BM25 ranks
+anything, as a SQL `WHERE`, not as a post-hoc trim of the top-k:
+
+| filter | flag | matches |
+|---|---|---|
+| project ("chapter") | `--project SUBSTR` | project directory name contains `SUBSTR` |
+| session ("page") | `--session SUBSTR` | session id (a UUID) contains `SUBSTR` |
+| date range | `--since ISO`, `--until ISO` | timestamp bounds, inclusive, either or both |
+| speaker | `--role {user,assistant,memory}` | exact match |
+| sidechain transcripts | `--no-sidechain` | excludes subagent transcripts (included by default) |
+
+Report §11.3 measured that embedding this same information *into the chunk text* makes retrieval
+worse (a −0.041 recall@10 cost for a two-line header alone) — so it is never in the indexed text.
+It is stored as columns on the `chunks` table and applied as a metadata filter instead, which is
+this module's whole reason filtering is a `WHERE` clause and not a second-pass re-rank.
+
+### Output — deterministic, for a machine reader
+
+`--json` is the contract for a calling agent: a fixed shape, never prose that has to be parsed.
+
+```json
+{
+  "query": "...", "k_requested": 10, "n_hits": 7,
+  "margin": 12.4, "weak_signal": false,
+  "hits": [ {"chunk_id": 1, "rank": 1, "score": 0.0, "text": "...",
+             "session_id": "...", "project": "...", "role": "...", "ts": "...",
+             "part": 0, "n_parts": 1, "source": "...", "is_sidechain": false }, ... ]
+}
+```
+
+Every hit carries project, role, timestamp, session id and source file — enough to cite the
+passage or go read the surrounding session deliberately.
+
+Exit codes are stable and mean the same thing in every mode: **0** = the query ran and found at
+least one passage; **1** = the query ran and found nothing; **2** = the query could not run at
+all (no index yet, an empty index, or a question with no searchable terms). A calling agent can
+branch on the exit code alone without parsing stderr.
+
+### Retrieval is asked for, never injected
+
+The study's load-bearing negative finding is that this system cannot reliably tell when it has
+found nothing: the top hit's raw score is statistically near-indistinguishable whether or not the
+answer is in the corpus (dense AUC 0.551, F6; re-measured for this system's own BM25 score,
+AUC 0.530, 95% CI [0.480, 0.582] — same conclusion). Anything that pastes top-k into every session
+would paste confident nonsense a large fraction of the time with no signal that it did — which is
+exactly why this is a command an agent calls, never a hook that runs automatically.
+
+`margin` (the score gap between rank 1 and rank 10, or the last hit if fewer) carries more signal
+than the raw score — but re-measured for this system specifically, that signal is real and modest
+(AUC 0.645, 95% CI [0.598, 0.690]), not the strong 0.724 a prior study found for a dense retriever
+on a different score scale. **It is deliberately not thresholded into a verdict.** Instead,
+`weak_signal` is a calibration-free structural flag — true when there are fewer than 2 hits (the
+margin is undefined) or fewer hits than requested (the index has thin coverage for this query) —
+and `false` otherwise. It does *not* mean "trust this"; it only means "there was enough returned
+material to have an opinion at all." Reading the actual passages, not just the score or the flag,
+is still the caller's job. Do not build a numeric confidence gate on top of `margin` without
+re-measuring it (O13 is still open) — the honest answer today is that a good gate does not exist
+yet.
+
+## Background indexing — so nobody has to remember to run it
+
+```sh
+scripts/install-timer.sh      # install a systemd --user timer, and start it now
+scripts/uninstall-timer.sh    # remove it (does not touch the index database)
+```
+
+This installs `~/.config/systemd/user/vdb-index.{service,timer}` from
+`systemd/vdb-index.service.in` (rendered with this checkout's absolute path — it does not assume
+the package is `pip install`-ed) and `systemd/vdb-index.timer`, then `systemctl --user enable
+--now`s the timer. It runs `vdb index --quiet` ~2 minutes after boot/login and every 15 minutes
+after that (`Persistent=true`, so a run missed while the machine was off or asleep still happens
+on the next wake). An incremental no-op run costs ~0.2s (see Index, above), so this cadence is
+cheap.
+
+**For it to run without anyone being logged in** (the actual "just works" requirement on a
+headless homeserver), the user needs systemd lingering enabled once:
+`sudo loginctl enable-linger $(whoami)`. The install script checks this and prints the command if
+it's missing, rather than silently leaving the timer only running while someone's logged in.
+
+This is a `systemd --user` timer, not a bespoke daemon — no framework, no supervisor process of
+its own, nothing that needs babysitting beyond what `systemctl --user status vdb-index.timer` and
+`journalctl --user -u vdb-index.service` already give you.
 
 ## Tests
 
@@ -106,8 +196,9 @@ is committed to this repository, ever.
 | `vdb/secrets.py` | the secret-shaped-string filter |
 | `vdb/chunk.py` | message-boundary chunking |
 | `vdb/store.py` | SQLite chunk store, FTS5 index, incremental update |
-| `vdb/retrieve.py` | BM25 query path, `Hit`/`Result` shapes |
-| `vdb/cli.py` | `index` / `query` / `stats` / `boilerplate` |
+| `vdb/retrieve.py` | BM25 query path, metadata filters, `Hit`/`Result` shapes, the margin/weak-signal diagnostic |
+| `vdb/cli.py` | `index` / `query` / `stats` / `boilerplate`; deterministic output and exit codes for an agent caller |
+| `systemd/`, `scripts/install-timer.sh`, `scripts/uninstall-timer.sh` | the background indexer (systemd `--user` timer) |
 
 ## Phase 2
 

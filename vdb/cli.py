@@ -1,8 +1,16 @@
 """Command line: `vdb index`, `vdb query`, `vdb stats`, `vdb boilerplate`.
 
+The primary caller is an agent, not a human at a terminal - so `query --json`
+output is deterministic and machine-parseable, and exit codes are stable:
+0 = hits returned, 1 = the query ran but found nothing, 2 = the query could
+not run at all (no index, an empty index, or an unparseable question). A
+human reading the plain-text output gets the identical information with
+headers and diagnostics attached.
+
 Delivery is an explicit command, by design. Report §13.2 makes this the
 load-bearing negative finding: retrieval cannot tell when it has found nothing
-(F6, AUC 0.551), so it must be asked, never injected silently into a session.
+(F6; re-measured for this retriever's own score in `vdb/retrieve.py`'s
+docstring), so it must be asked, never injected silently into a session.
 """
 
 from __future__ import annotations
@@ -74,7 +82,9 @@ def cmd_query(args) -> int:
             k=args.k,
             project=args.project,
             role=args.role,
+            session=args.session,
             since=args.since,
+            until=args.until,
             include_sidechain=not args.no_sidechain,
         )
     except ValueError as exc:
@@ -86,16 +96,20 @@ def cmd_query(args) -> int:
             json.dumps(
                 {
                     "query": result.query,
+                    "k_requested": result.k_requested,
+                    "n_hits": len(result.hits),
                     "margin": result.margin,
+                    "weak_signal": result.weak_signal,
                     "hits": [h.__dict__ for h in result.hits],
                 },
                 indent=2,
             )
         )
-        return 0
+        return 0 if result.hits else 1
 
     if not result.hits:
-        print("no passages matched.")
+        print("no passages matched — this may mean the index has nothing on this, "
+              "not that nothing on this exists (this system cannot tell the two apart).")
         return 1
     for hit in result.hits:
         body = hit.text if args.full else textwrap.shorten(
@@ -106,9 +120,18 @@ def cmd_query(args) -> int:
         print(f"    {hit.source}")
         print(textwrap.indent(body, "    "))
     if result.margin is not None:
+        print(f"\nrank1–rank{min(10, len(result.hits))} margin: {result.margin}")
+    if result.weak_signal:
         print(
-            f"\nrank1–rank{min(10, len(result.hits))} margin: {result.margin} "
-            "(a signal, not a verdict — this system cannot tell when it has nothing)"
+            "weak signal: fewer results than usual for this index — treat these "
+            "passages with more caution than a full, well-separated result set "
+            "(this is a structural flag, not a validated confidence score; see README)"
+        )
+    else:
+        print(
+            "(the margin above is a diagnostic, not a verdict — this system "
+            "cannot reliably tell a good match from a mediocre one; read the "
+            "passages, don't just trust the ranking)"
         )
     return 0
 
@@ -158,8 +181,10 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("question")
     q.add_argument("-k", type=int, default=10, help="number of passages (default 10)")
     q.add_argument("--project", help="restrict to projects whose directory name contains this")
-    q.add_argument("--role", choices=["user", "assistant", "memory"])
+    q.add_argument("--role", choices=["user", "assistant", "memory"], help="the speaker")
+    q.add_argument("--session", help="restrict to session ids containing this (a session is one transcript)")
     q.add_argument("--since", help="ISO timestamp lower bound, e.g. 2026-01-01")
+    q.add_argument("--until", help="ISO timestamp upper bound, e.g. 2026-06-30")
     q.add_argument("--no-sidechain", action="store_true", help="exclude subagent transcripts")
     q.add_argument("--full", action="store_true", help="print whole passages, not excerpts")
     q.add_argument("--width", type=int, default=400, help="excerpt width (default 400)")

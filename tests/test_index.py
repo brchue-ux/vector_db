@@ -217,6 +217,48 @@ class Boilerplate(IndexBase):
         self.assertTrue(self.search("appears exactly once").hits)
 
 
+class Filters(IndexBase):
+    """Metadata pre-filtering: the captain's chapter/page/paragraph (§13.1)."""
+
+    def setUp(self):
+        super().setUp()
+        fx.write_transcript(
+            self.root, "proj-alpha", "sess-early",
+            [fx.user_entry("the deploy pipeline needs a rollback button", session="sess-early",
+                            ts="2026-01-10T09:00:00Z")],
+        )
+        fx.write_transcript(
+            self.root, "proj-beta", "sess-late",
+            [fx.user_entry("the deploy pipeline needs better logging", session="sess-late",
+                            ts="2026-06-10T09:00:00Z")],
+        )
+        self.index()
+
+    def test_project_filters_to_matching_directory(self):
+        hits = self.search("deploy pipeline", project="alpha").hits
+        self.assertTrue(hits)
+        self.assertTrue(all(h.project == "proj-alpha" for h in hits))
+
+    def test_session_filters_to_matching_session(self):
+        hits = self.search("deploy pipeline", session="sess-late").hits
+        self.assertTrue(hits)
+        self.assertTrue(all(h.session_id == "sess-late" for h in hits))
+
+    def test_since_and_until_bound_the_date_range(self):
+        hits = self.search("deploy pipeline", since="2026-03-01").hits
+        self.assertTrue(all(h.ts >= "2026-03-01" for h in hits))
+        hits = self.search("deploy pipeline", until="2026-03-01").hits
+        self.assertTrue(all(h.ts <= "2026-03-01" for h in hits))
+
+    def test_since_and_until_can_bracket_a_range(self):
+        hits = self.search("deploy pipeline", since="2026-05-01", until="2026-07-01").hits
+        self.assertEqual([h.session_id for h in hits], ["sess-late"])
+
+    def test_filters_narrow_before_matching_not_after(self):
+        # a filter that matches nothing returns nothing, not an error
+        self.assertEqual(self.search("deploy pipeline", project="does-not-exist").hits, [])
+
+
 class Seam(unittest.TestCase):
     def test_retriever_shape_is_what_phase_two_fuses(self):
         # Phase 2 adds a dense retriever and RRF over two ranked lists. The only
@@ -230,8 +272,37 @@ class Seam(unittest.TestCase):
 
     def test_margin_is_reported_not_thresholded(self):
         hits = [retrieve.Hit(chunk_id=i, rank=i, score=10.0 - i, text="x") for i in range(1, 11)]
-        res = retrieve.Result(query="q", hits=hits)
+        res = retrieve.Result(query="q", k_requested=10, hits=hits)
         self.assertAlmostEqual(res.margin, 9.0)
+
+
+class WeakSignal(unittest.TestCase):
+    """A calibration-free structural flag, not an invented confidence score."""
+
+    def _hits(self, n):
+        return [retrieve.Hit(chunk_id=i, rank=i, score=10.0 - i, text="x") for i in range(1, n + 1)]
+
+    def test_no_hits_is_weak(self):
+        res = retrieve.Result(query="q", k_requested=10, hits=[])
+        self.assertTrue(res.weak_signal)
+        self.assertIsNone(res.margin)
+
+    def test_a_single_hit_is_weak_margin_undefined(self):
+        res = retrieve.Result(query="q", k_requested=10, hits=self._hits(1))
+        self.assertTrue(res.weak_signal)
+        self.assertIsNone(res.margin)
+
+    def test_fewer_hits_than_requested_is_weak(self):
+        res = retrieve.Result(query="q", k_requested=10, hits=self._hits(3))
+        self.assertTrue(res.weak_signal)
+
+    def test_a_full_result_set_is_not_flagged_weak(self):
+        res = retrieve.Result(query="q", k_requested=10, hits=self._hits(10))
+        self.assertFalse(res.weak_signal)
+
+    def test_a_full_result_set_at_a_smaller_requested_k_is_not_weak(self):
+        res = retrieve.Result(query="q", k_requested=3, hits=self._hits(3))
+        self.assertFalse(res.weak_signal)
 
 
 class Defaults(unittest.TestCase):

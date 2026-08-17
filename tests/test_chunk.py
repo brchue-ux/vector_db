@@ -1,8 +1,8 @@
-"""Message-boundary chunking (report §11.1-§11.3, §13.1).
+"""Message-boundary chunking (report §11.1-§11.3, §13.1; threshold: `vdbtray`).
 
 The chunking contract is the single biggest measured quality lever in the study,
 so it is tested as a contract: one chunk per message, split at paragraph
-boundaries near 1,800 chars, no overlap, message text only.
+boundaries near the configured limit, no overlap, message text only.
 """
 
 import unittest
@@ -19,8 +19,11 @@ class ChunkContract(unittest.TestCase):
         text = "a question\n\nwith two paragraphs"
         self.assertEqual(split_message(text), [text])
 
-    def test_limit_default_is_1800(self):
-        self.assertEqual(LIMIT, 1800)
+    def test_limit_default_is_1000(self):
+        # vdbtray chunk-granularity experiment: the lowest threshold with no
+        # measured recall/MRR cost on any query family. Do not change this
+        # without re-running that sweep.
+        self.assertEqual(LIMIT, 1000)
 
     def test_message_at_the_limit_is_not_split(self):
         text = "y" * LIMIT

@@ -1,22 +1,35 @@
 """Message-boundary chunking (report §11.1-§11.3, recommendation §13.1).
 
-One chunk per message. Messages longer than ~1,800 characters are split at
+One chunk per message. Messages longer than ~1,000 characters are split at
 paragraph boundaries, then line boundaries, then hard character boundaries.
 No overlap. Nothing in the chunk but the message's own text.
 
-This is the single largest measured effect in the whole study: message
-boundaries beat 600-character windows by +0.085 recall@10, CI [+0.044, +0.126],
-*at matched chunk size*. Adding a two-line provenance header costs -0.041, and
-prepending the previous turn cuts cross-session recall by more than half
-(0.533 -> 0.250). Provenance is stored as metadata alongside the chunk and is
-deliberately not part of the indexed text.
+Message-boundary chunking itself is the single largest measured effect in the
+whole `vdbqual` study: it beats 600-character fixed windows by +0.085
+recall@10, CI [+0.044, +0.126], *at matched chunk size*. Adding a two-line
+provenance header costs -0.041, and prepending the previous turn cuts
+cross-session recall by more than half (0.533 -> 0.250). Provenance is stored
+as metadata alongside the chunk and is deliberately not part of the indexed
+text.
+
+The split threshold for long messages (1,000, not `vdbqual`'s untested 1,800
+default) is a separate finding, from the `vdbtray` chunk-granularity
+experiment: the captain's own messages average ~6,800 chars and are the ones
+this threshold cuts, so a follow-up study swept it directly. 1,000 is the
+lowest threshold with no measured recall or MRR cost on any query family
+(including the family the source study trusts most when families disagree) -
+lower thresholds measurably cost recall on genuine question-answering. At
+1,000, the chunk that actually answers a query is ~45% smaller (median 1,470
+-> 779 chars) than at 1,800, for that same accuracy. See the `vdbtray` report
+(outside this repo - it describes the corpus and is never committed) for the
+full sweep, census, and confidence intervals.
 """
 
 from __future__ import annotations
 
 import re
 
-LIMIT = 1800
+LIMIT = 1000
 
 _PARA = re.compile(r"(\n\s*\n)")
 _LINE = re.compile(r"(\n)")
