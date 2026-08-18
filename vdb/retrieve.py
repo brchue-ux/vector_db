@@ -9,6 +9,12 @@ The seam for that is exactly this module's `Hit` shape and `search()`
 signature - a second retriever returns the same `(chunk_id, rank, score)` and a
 fusion function combines two ranked lists. Nothing more is built for it here.
 
+The same seam also carries the implicit-feedback score nudge
+(data/vdbfeedback/report.md §5.3, outside this repo): a capped additive
+adjustment from `store.chunk_feedback`, gated by `store.nudge_active()` and
+shipped OFF (see that function's docstring for the three conditions it
+requires). Below the gate it never reads `chunk_feedback` at all.
+
 No confidence gate is applied - and there is not a strong enough measured
 signal to build one on. Report F6 found absolute similarity carries no usable
 signal (AUC 0.551) and the rank-1-to-rank-10 margin does better (AUC 0.724) -
@@ -30,6 +36,8 @@ from __future__ import annotations
 import re
 import sqlite3
 from dataclasses import dataclass, field
+
+from . import store as store_mod
 
 _WORD = re.compile(r"[0-9A-Za-z_]+", re.UNICODE)
 MAX_QUERY_TERMS = 64
@@ -62,6 +70,7 @@ class Result:
     query: str
     k_requested: int = 10
     hits: list[Hit] = field(default_factory=list)
+    nudge_applied: bool = False
 
     @property
     def margin(self) -> float | None:
@@ -186,4 +195,23 @@ class BM25Retriever:
             )
             for i, row in enumerate(self.conn.execute(sql, params), start=1)
         ]
-        return Result(query=question, k_requested=k, hits=hits)
+
+        # Implicit-feedback score nudge (data/vdbfeedback/report.md §5.3), the
+        # seam this module's own docstring reserves for a second retriever.
+        # `nudge_active()` is the real runtime gate (report §6.3): below the
+        # 300-label threshold, or with the flag off, or with no recorded
+        # passing regression check, this block does not run at all - the
+        # nudge is provably inert, not just defaulted off. When it does run,
+        # it only reorders the already-fetched top-k (never pulls in
+        # candidates BM25 itself did not return), keeping its influence
+        # bounded as documented in `store.NUDGE_WEIGHT`/`NUDGE_CAP`.
+        nudged = False
+        if hits and store_mod.nudge_active(self.conn):
+            nudged = True
+            for hit in hits:
+                hit.score = round(hit.score + store_mod.score_nudge(self.conn, hit.chunk_id), 4)
+            hits.sort(key=lambda h: h.score, reverse=True)
+            for i, hit in enumerate(hits, start=1):
+                hit.rank = i
+
+        return Result(query=question, k_requested=k, hits=hits, nudge_applied=nudged)

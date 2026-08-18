@@ -1,0 +1,15 @@
+[Unit]
+Description=vdb: background implicit-feedback label extraction
+# Reads query_log + feedback_citation and, for cited queries old enough that
+# downstream evidence can plausibly exist, scans the caller's own transcript
+# (read-only against ~/.claude) for a confirm/correction signal. Writes only
+# to the vdb index database - never to the corpus.
+
+[Service]
+Type=oneshot
+WorkingDirectory=@REPO_ROOT@
+Environment=PYTHONPATH=@REPO_ROOT@
+ExecStart=@PYTHON@ -m vdb label --quiet
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

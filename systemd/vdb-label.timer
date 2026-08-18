@@ -1,0 +1,13 @@
+[Unit]
+Description=vdb: periodically extract implicit-feedback labels
+
+[Timer]
+# Labelling evidence can be several turns downstream of the query
+# (report §4.1), so this runs less often than the index timer - every 30
+# minutes is plenty; each run only touches cited queries not yet labelled.
+OnBootSec=10min
+OnUnitActiveSec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

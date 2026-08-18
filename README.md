@@ -6,10 +6,13 @@ context, and gets back a handful of short, provenance-tagged passages instead of
 conversation. There is deliberately no UI and no visual app here, and none is planned — the
 consumer is an agent, not a human doing his own searching.
 
-**Status: phase 1 + the agent-facing tool shipped.** Ingest, cleaning, message-boundary
-chunking, a BM25 keyword index, metadata pre-filtering, and a deterministic, agent-callable query
-command with a background indexer. No model, no vectors, no network, no dependencies beyond the
-Python standard library. Phase 2 adds a dense index and reciprocal-rank fusion.
+**Status: phase 1 + the agent-facing tool + implicit-feedback logging shipped.** Ingest,
+cleaning, message-boundary chunking, a BM25 keyword index, metadata pre-filtering, a
+deterministic agent-callable query command, a background indexer, and query/citation/label
+logging for an implicit-feedback loop (`vdb feedback`, `vdb label`) — with its
+score-affecting nudge built but shipped off (see "Feedback" below). No model, no vectors, no
+network, no dependencies beyond the Python standard library. Phase 2 adds a dense index and
+reciprocal-rank fusion.
 
 Everything here implements the retrieval-quality study (`vdbqual` report §13) plus the follow-up
 `vdbtray` chunk-granularity experiment that set the split threshold below. Both measured real
@@ -106,6 +109,14 @@ anything, as a SQL `WHERE`, not as a post-hoc trim of the top-k:
 | speaker | `--role {user,assistant,memory}` | exact match |
 | sidechain transcripts | `--no-sidechain` | excludes subagent transcripts (included by default) |
 
+**A rough date-window filter is not a safe default for "have we discussed this before"
+queries.** `vdbaccuracy` §3.5/§5.1 measured that for the cross-session recall family
+(the gold passage displaced in time, not near the question), date-window filtering
+*hurts* — the whole premise of that family is that the answer isn't where you'd guess
+to narrow to. Date filtering helps other families (a known, recent window). Reach for
+`--since`/`--until` when you have a real reason to believe the answer is in that
+window, not as a default "narrow it down" move.
+
 Report §11.3 measured that embedding this same information *into the chunk text* makes retrieval
 worse (a −0.041 recall@10 cost for a two-line header alone) — so it is never in the indexed text.
 It is stored as columns on the `chunks` table and applied as a metadata filter instead, which is
@@ -117,8 +128,8 @@ this module's whole reason filtering is a `WHERE` clause and not a second-pass r
 
 ```json
 {
-  "query": "...", "k_requested": 10, "n_hits": 7,
-  "margin": 12.4, "weak_signal": false,
+  "query_id": 42, "query": "...", "k_requested": 10, "n_hits": 7,
+  "margin": 12.4, "weak_signal": false, "nudge_applied": false,
   "hits": [ {"chunk_id": 1, "rank": 1, "score": 0.0, "text": "...",
              "session_id": "...", "project": "...", "role": "...", "ts": "...",
              "part": 0, "n_parts": 1, "source": "...", "is_sidechain": false }, ... ]
@@ -126,7 +137,8 @@ this module's whole reason filtering is a `WHERE` clause and not a second-pass r
 ```
 
 Every hit carries project, role, timestamp, session id and source file — enough to cite the
-passage or go read the surrounding session deliberately.
+passage or go read the surrounding session deliberately. `query_id` is what you pass to `vdb
+feedback` (see "Feedback" below) — cite it if you act on a result.
 
 Exit codes are stable and mean the same thing in every mode: **0** = the query ran and found at
 least one passage; **1** = the query ran and found nothing; **2** = the query could not run at
@@ -154,20 +166,59 @@ is still the caller's job. Do not build a numeric confidence gate on top of `mar
 re-measuring it (O13 is still open) — the honest answer today is that a good gate does not exist
 yet.
 
+## Feedback — how this index learns from real use
+
+Implements `data/vdbfeedback/report.md` (outside this repo). The short version: **cite
+what you use, and this system slowly gets better at ranking it; don't, and nothing about
+retrieval changes.**
+
+1. Every `vdb query` writes a `query_log` row and prints a `query_id`, whether or not
+   you cite anything. This alone changes nothing about ranking.
+2. **If you act on a returned passage, cite it:**
+   ```sh
+   vdb feedback <query_id> --used <chunk_id>[,<chunk_id>...]
+   vdb feedback <query_id> --used ""       # queried, used nothing — also a real signal
+   ```
+   This is the single highest-leverage thing a calling agent can do here. An uncited
+   query is logged, never scored — it is not diluted as partial credit across the
+   results (report §4.2–§4.3: with recall@10 well under 100% even in the best filtered
+   condition, most of a typical top-k didn't matter even on a successful query, so
+   smearing credit across all of it would reward passages that merely rode along).
+3. A background pass (`vdb label`, installed as a second systemd timer alongside the
+   indexer — see below) reads cited queries old enough for downstream evidence to exist,
+   scans your own session's transcript forward for a confirm/correction signal (two
+   heuristic tiers: casual chat, and this environment's structured
+   supervisor/decision-relay register), and writes `feedback_label` rows. Only clean,
+   single-class labels ("mixed" — confirms one thing, corrects another — is recorded but
+   never scored) update the per-chunk feedback counts.
+4. **The score-affecting nudge (a small, capped additive adjustment to BM25 scores) is
+   implemented but ships OFF**, and stays off — regardless of any flag — until 300
+   high-confidence cited labels exist *and* a regression check against the static eval
+   sets has been explicitly recorded as passed. `vdb nudge --json` reports live status;
+   `scripts/nudge-regression-check.md` documents the check. See `AGENTS.md` before ever
+   touching this.
+
+Attribution to "your own session" uses `$CLAUDE_CODE_SESSION_ID` (confirmed to match the
+transcript's own filename/`sessionId` — see `AGENTS.md`), captured automatically by
+`vdb query` unless you pass `--caller-session` yourself.
+
 ## Background indexing — so nobody has to remember to run it
 
 ```sh
-scripts/install-timer.sh      # install a systemd --user timer, and start it now
-scripts/uninstall-timer.sh    # remove it (does not touch the index database)
+scripts/install-timer.sh      # install both systemd --user timers, and start them now
+scripts/uninstall-timer.sh    # remove them (does not touch the index database)
 ```
 
-This installs `~/.config/systemd/user/vdb-index.{service,timer}` from
-`systemd/vdb-index.service.in` (rendered with this checkout's absolute path — it does not assume
-the package is `pip install`-ed) and `systemd/vdb-index.timer`, then `systemctl --user enable
---now`s the timer. It runs `vdb index --quiet` ~2 minutes after boot/login and every 15 minutes
-after that (`Persistent=true`, so a run missed while the machine was off or asleep still happens
-on the next wake). An incremental no-op run costs ~0.2s (see Index, above), so this cadence is
-cheap.
+This installs `~/.config/systemd/user/vdb-{index,label}.{service,timer}`, rendered from
+`systemd/vdb-{index,label}.service.in` with this checkout's absolute path (it does not
+assume the package is `pip install`-ed), then `systemctl --user enable --now`s both
+timers. `vdb-index` runs `vdb index --quiet` ~2 minutes after boot/login and every 15
+minutes after that; `vdb-label` runs `vdb label --quiet` ~10 minutes after boot/login and
+every 30 minutes after that (labelling evidence can be several turns downstream of the
+query, report §4.1, so it doesn't need the indexer's tighter cadence). Both use
+`Persistent=true`, so a run missed while the machine was off or asleep still happens on
+the next wake. An incremental no-op index run costs ~0.2s (see Index, above); a label
+pass with nothing newly eligible is comparably cheap.
 
 **For it to run without anyone being logged in** (the actual "just works" requirement on a
 headless homeserver), the user needs systemd lingering enabled once:
@@ -196,9 +247,11 @@ is committed to this repository, ever.
 | `vdb/secrets.py` | the secret-shaped-string filter |
 | `vdb/chunk.py` | message-boundary chunking |
 | `vdb/store.py` | SQLite chunk store, FTS5 index, incremental update |
-| `vdb/retrieve.py` | BM25 query path, metadata filters, `Hit`/`Result` shapes, the margin/weak-signal diagnostic |
-| `vdb/cli.py` | `index` / `query` / `stats` / `boilerplate`; deterministic output and exit codes for an agent caller |
-| `systemd/`, `scripts/install-timer.sh`, `scripts/uninstall-timer.sh` | the background indexer (systemd `--user` timer) |
+| `vdb/retrieve.py` | BM25 query path, metadata filters, `Hit`/`Result` shapes, the margin/weak-signal diagnostic, the (gated-off) score nudge |
+| `vdb/feedback.py` | the background label-extraction pass (`vdb label`): heuristic confirm/correction classification, boilerplate-aware transcript scanning |
+| `vdb/cli.py` | `index` / `query` / `feedback` / `label` / `nudge` / `stats` / `boilerplate`; deterministic output and exit codes for an agent caller |
+| `systemd/`, `scripts/install-timer.sh`, `scripts/uninstall-timer.sh` | the background indexer + label pass (two systemd `--user` timers) |
+| `scripts/nudge-regression-check.md` | the §6.2c procedure to run before ever flipping the score nudge on |
 
 ## Phase 2
 
