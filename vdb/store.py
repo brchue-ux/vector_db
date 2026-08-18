@@ -16,7 +16,7 @@ transcripts (F9), so the database file is created 0600 inside a 0700 directory.
 Implicit-feedback learning loop (data/vdbfeedback/report.md, outside this repo):
 `query_log`/`feedback_citation`/`feedback_label`/`chunk_feedback` live in this
 same database - one artefact to protect, not a second file. See the functions
-below `stats()` and `AGENTS.md` for the 300-label threshold and the runtime
+below `stats()` and `AGENTS.md` for the two-part (global + per-chunk) runtime
 gate that keeps the score-affecting nudge inert until it is explicitly earned.
 """
 
@@ -154,10 +154,44 @@ CREATE TABLE IF NOT EXISTS chunk_feedback (
 );
 """
 
-# The score-affecting nudge does not turn on until this many high-confidence,
-# cited labels exist (report §6.3, §7). Below this, `nudge_active()` is False
-# regardless of the feature flag - a real runtime check, not a TODO.
-NUDGE_LABEL_THRESHOLD = 300
+# The GLOBAL half of the nudge gate: `nudge_active()` stays False below this
+# many corpus-wide high-confidence, cited, non-held-out labels, regardless of
+# the feature flag (report §6.3). The report's own 300 was "a round number in
+# the same range vdbqual's smallest reliable family (C, n=60) and
+# vdbaccuracy's bootstrap intervals treat as the floor for saying anything
+# with confidence" (§6.3/§7) - 300 was chosen when the *only* gate was this
+# global count, i.e. it had to carry both "the check is worth running" and
+# "the system broadly behaves". Now that a second, PER-CHUNK gate
+# (`NUDGE_PER_CHUNK_MIN`, below) separately carries per-passage confidence,
+# this global number only needs to answer "is there enough accumulated data
+# for the §6.2c regression check to be meaningful at all" - and the report's
+# own citation for 300 already names a smaller number that this domain treats
+# as trustworthy for that: vdbqual's smallest reliable family, C, n=60. 60 is
+# used here rather than re-deriving a new number, because it is not a guess -
+# it is a floor this project's own eval methodology already relies on.
+NUDGE_LABEL_THRESHOLD = 60
+
+# The PER-CHUNK half of the nudge gate: a chunk's own score nudge is applied
+# only once THAT chunk has accumulated at least this many of its own
+# high-confidence, cited, non-held-out labels (`positive_n + negative_n`).
+# Chunks below this are not nudged even when the global gate above is fully
+# satisfied - `score_nudge()` returns 0.0 for them (report's per-passage
+# evidence requirement, task brief "Change 2").
+#
+# This is a confidence floor, not a "wait for any signal at all" gate: under
+# `score_nudge()`'s own `NUDGE_WEIGHT * log(1 + min(n, NUDGE_CAP))` formula, a
+# single citation (n=1) already produces a small nonzero nudge
+# (0.15 * log(2) ~= 0.104) - so the threshold's job is not to suppress a
+# first data point, it is to require more than one before treating it as
+# reliable. §3.4's hand-validation found that even after the "clean,
+# single-class" filter this project already applies, only ~70% of labels
+# survive as genuinely clean - i.e. roughly a 30% chance any single
+# high-confidence label is still wrong. Three independent citations pointing
+# the same direction is the smallest multiplicity where "wrong 30% of the
+# time" no longer plausibly explains the accumulated sign of the nudge, while
+# staying far below `NUDGE_CAP` (20) so it works purely as a floor, not as a
+# second cap.
+NUDGE_PER_CHUNK_MIN = 3
 
 # Inside `score_nudge()`'s log(1 + min(n, CAP)): bounds how far a single
 # chunk's score can move even under a burst of repeated labels (report §6.2a
@@ -422,6 +456,38 @@ def stats(conn: sqlite3.Connection) -> dict:
         "last_index": (conn.execute("SELECT value FROM meta WHERE key='last_index'").fetchone()
                        or [None])[0],
         "root": (conn.execute("SELECT value FROM meta WHERE key='root'").fetchone() or [None])[0],
+        "citation_compliance": citation_compliance(conn),
+    }
+
+
+CITATION_COMPLIANCE_WINDOW = 200
+
+
+def citation_compliance(conn: sqlite3.Connection, window: int = CITATION_COMPLIANCE_WINDOW) -> dict:
+    """What fraction of recent `vdb query` calls got a matching `vdb feedback` citation.
+
+    Change 1 of the task brief: citation cannot be forced across two separate
+    CLI invocations, so this is the visible compliance signal that lets drift
+    be caught instead of silently accepted (`vdb stats`). Looks at the most
+    recent `window` query_log rows (by id, i.e. by call order) - recent
+    behaviour, not all-time history, is what a calling agent's current
+    compliance actually looks like.
+    """
+    row = conn.execute(
+        "SELECT COUNT(*) AS n, "
+        "SUM(CASE WHEN fc.query_id IS NOT NULL THEN 1 ELSE 0 END) AS cited "
+        "FROM (SELECT id FROM query_log ORDER BY id DESC LIMIT ?) ql "
+        "LEFT JOIN feedback_citation fc ON fc.query_id = ql.id",
+        (window,),
+    ).fetchone()
+    n = row["n"] or 0
+    cited = row["cited"] or 0
+    return {
+        "window": window,
+        "queries": n,
+        "cited": cited,
+        "uncited": n - cited,
+        "citation_rate": round(cited / n, 4) if n else None,
     }
 
 
@@ -532,15 +598,39 @@ def apply_feedback_to_chunks(conn: sqlite3.Connection, chunk_ids: list[int], lab
         )
 
 
-def score_nudge(conn: sqlite3.Connection, chunk_id: int) -> float:
-    """The capped additive BM25 score adjustment for one chunk (report §5.3).
+def chunk_label_count(conn: sqlite3.Connection, chunk_id: int) -> int:
+    """This chunk's own accumulated evidence (`positive_n + negative_n`).
 
-    `score' = score + NUDGE_WEIGHT * (log(1 + min(pos, CAP)) - log(1 + min(neg, CAP)))`
+    What `NUDGE_PER_CHUNK_MIN` is measured against - exposed separately from
+    `score_nudge()` so callers (tests, `vdb nudge`) can inspect the per-chunk
+    gate without recomputing the score math.
     """
     row = conn.execute(
         "SELECT positive_n, negative_n FROM chunk_feedback WHERE chunk_id = ?", (chunk_id,)
     ).fetchone()
     if not row:
+        return 0
+    return row["positive_n"] + row["negative_n"]
+
+
+def score_nudge(conn: sqlite3.Connection, chunk_id: int) -> float:
+    """The capped additive BM25 score adjustment for one chunk (report §5.3).
+
+    `score' = score + NUDGE_WEIGHT * (log(1 + min(pos, CAP)) - log(1 + min(neg, CAP)))`
+
+    Gated per-chunk (task brief "Change 2"): a chunk with fewer than
+    `NUDGE_PER_CHUNK_MIN` of its own labels returns 0.0 here - `score' =
+    score`, exactly today's shipped behaviour - even when the caller has
+    already confirmed the global `nudge_active()` gate is satisfied. Neither
+    gate replaces the other; this function only ever enforces the per-chunk
+    half.
+    """
+    row = conn.execute(
+        "SELECT positive_n, negative_n FROM chunk_feedback WHERE chunk_id = ?", (chunk_id,)
+    ).fetchone()
+    if not row:
+        return 0.0
+    if row["positive_n"] + row["negative_n"] < NUDGE_PER_CHUNK_MIN:
         return 0.0
     pos = min(row["positive_n"], NUDGE_CAP)
     neg = min(row["negative_n"], NUDGE_CAP)
@@ -612,9 +702,13 @@ def record_regression_check(conn: sqlite3.Connection, passed: bool, notes: str =
 def nudge_active(conn: sqlite3.Connection) -> bool:
     """The real runtime gate (report §6.3) - not documentation asking someone to remember.
 
-    All three must hold: the operator flag, the 300-label volume threshold,
-    and an explicitly recorded passing regression check. Below any of these,
-    `BM25Retriever.search()` must not read `chunk_feedback` at all.
+    This is the GLOBAL half of the gate: all three must hold - the operator
+    flag, the `NUDGE_LABEL_THRESHOLD` corpus-wide volume floor, and an
+    explicitly recorded passing regression check. Below any of these,
+    `BM25Retriever.search()` must not read `chunk_feedback` at all. Even when
+    this returns True, an individual chunk is only nudged once it separately
+    clears the PER-CHUNK gate - see `score_nudge()`'s `NUDGE_PER_CHUNK_MIN`
+    check. Neither gate substitutes for the other.
     """
     if not nudge_flag_enabled(conn):
         return False

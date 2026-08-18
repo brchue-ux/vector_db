@@ -13,12 +13,16 @@ load-bearing negative finding: retrieval cannot tell when it has found nothing
 (F6; re-measured for this retriever's own score in `vdb/retrieve.py`'s
 docstring), so it must be asked, never injected silently into a session.
 
-Every `query` prints a `query_id`. If you act on a returned passage, cite it
-with `vdb feedback <query_id> --used <chunk_id>[,...]` (an empty `--used` is
-a valid "queried, used nothing" signal) - this is the only thing that lets
-`vdb label`'s background pass (data/vdbfeedback/report.md §8 step 3) ever
-attribute a confirm/correction to a specific passage. Uncited queries are
-still logged, never scored.
+Every `query` prints a `query_id` AND the exact citation follow-up command,
+every single time, in both human and `--json` output - this cannot be
+enforced across two separate CLI invocations, so the tool insists loudly
+instead of hoping the caller remembers. If you act on a returned passage,
+cite it with `vdb feedback <query_id> --used <chunk_id>[,...]` (an empty
+`--used` is a valid "queried, used nothing" signal) - this is the only thing
+that lets `vdb label`'s background pass (data/vdbfeedback/report.md §8 step
+3) ever attribute a confirm/correction to a specific passage. Uncited queries
+are still logged, never scored. Check whether citation is actually happening
+with `vdb stats` (`citation_compliance`).
 """
 
 from __future__ import annotations
@@ -121,6 +125,16 @@ def cmd_query(args) -> int:
         caller_session=caller_session,
     )
 
+    citation_cmd = f'vdb feedback {query_id} --used <chunk_id>[,<chunk_id>...]'
+    citation_cmd_used_nothing = f'vdb feedback {query_id} --used ""'
+    citation_reminder = (
+        "citation is expected after every query you act on: run "
+        f"`{citation_cmd}` if you used a result, or `{citation_cmd_used_nothing}` "
+        "if you queried and used nothing — this is what lets the index learn "
+        "from real use (see README 'Feedback'; check compliance any time with "
+        "`vdb stats`)"
+    )
+
     if args.json:
         print(
             json.dumps(
@@ -133,6 +147,10 @@ def cmd_query(args) -> int:
                     "weak_signal": result.weak_signal,
                     "nudge_applied": result.nudge_applied,
                     "hits": [h.__dict__ for h in result.hits],
+                    "citation_expected": True,
+                    "citation_command": citation_cmd,
+                    "citation_command_used_nothing": citation_cmd_used_nothing,
+                    "citation_reminder": citation_reminder,
                 },
                 indent=2,
             )
@@ -142,7 +160,7 @@ def cmd_query(args) -> int:
     if not result.hits:
         print("no passages matched — this may mean the index has nothing on this, "
               "not that nothing on this exists (this system cannot tell the two apart).")
-        print(f"\nquery_id: {query_id}")
+        print(f"\nquery_id: {query_id}  — {citation_reminder}")
         return 1
     for hit in result.hits:
         body = hit.text if args.full else textwrap.shorten(
@@ -167,12 +185,7 @@ def cmd_query(args) -> int:
             "cannot reliably tell a good match from a mediocre one; read the "
             "passages, don't just trust the ranking)"
         )
-    print(
-        f"\nquery_id: {query_id}  — if you act on one of these passages, cite it: "
-        f"`vdb feedback {query_id} --used <chunk_id>[,<chunk_id>...]` (or "
-        f"`--used \"\"` if you queried but used none). This is what makes this "
-        f"index able to learn from real use — see README 'Feedback'."
-    )
+    print(f"\nquery_id: {query_id}  — {citation_reminder}")
     return 0
 
 
@@ -223,11 +236,15 @@ def cmd_label(args) -> int:
 def cmd_nudge(args) -> int:
     """Status and control for the score-affecting nudge's runtime gate (report §6.3).
 
-    Setting `--enable` only flips the operator flag - `store.nudge_active()`
-    still requires the 300-label volume threshold AND a recorded passing
-    regression check (`--record-check`) before the nudge actually does
-    anything. See `scripts/nudge-regression-check.md` before ever recording
-    a pass.
+    Two gates, both required (see `vdb/store.py`'s `NUDGE_LABEL_THRESHOLD` and
+    `NUDGE_PER_CHUNK_MIN` docstrings for why each number is what it is):
+    - GLOBAL: the operator flag, `store.NUDGE_LABEL_THRESHOLD` corpus-wide
+      qualifying labels, and a recorded passing regression check
+      (`--record-check`) - `store.nudge_active()`. Setting `--enable` only
+      flips the operator flag; the other two conditions still apply. See
+      `scripts/nudge-regression-check.md` before ever recording a pass.
+    - PER-CHUNK: a specific chunk's own accumulated evidence must separately
+      clear `store.NUDGE_PER_CHUNK_MIN` - pass `--chunk <id>` to inspect one.
     """
     conn = store.connect(args.db)
     if args.enable:
@@ -242,17 +259,29 @@ def cmd_nudge(args) -> int:
     status = {
         "flag_enabled": store.nudge_flag_enabled(conn),
         "qualifying_labels": store.qualifying_label_count(conn),
-        "threshold": store.NUDGE_LABEL_THRESHOLD,
+        "global_threshold": store.NUDGE_LABEL_THRESHOLD,
         "regression_check": store.regression_check_status(conn),
         "active": store.nudge_active(conn),
+        "per_chunk_threshold": store.NUDGE_PER_CHUNK_MIN,
     }
+    if args.chunk is not None:
+        status["chunk_id"] = args.chunk
+        status["chunk_label_count"] = store.chunk_label_count(conn, args.chunk)
+        status["chunk_qualifies"] = status["chunk_label_count"] >= store.NUDGE_PER_CHUNK_MIN
+        status["chunk_nudged"] = status["active"] and status["chunk_qualifies"]
+
     if args.json:
         print(json.dumps(status, indent=2))
     else:
-        print(f"flag enabled:       {status['flag_enabled']}")
-        print(f"qualifying labels:  {status['qualifying_labels']} / {status['threshold']}")
-        print(f"regression check:   {status['regression_check']}")
-        print(f"NUDGE ACTIVE:       {status['active']}")
+        print(f"flag enabled:          {status['flag_enabled']}")
+        print(f"qualifying labels:     {status['qualifying_labels']} / {status['global_threshold']}"
+              " (global gate)")
+        print(f"regression check:      {status['regression_check']}")
+        print(f"NUDGE ACTIVE (global): {status['active']}")
+        print(f"per-chunk threshold:   {status['per_chunk_threshold']} labels")
+        if args.chunk is not None:
+            print(f"chunk {status['chunk_id']} labels:   {status['chunk_label_count']}")
+            print(f"chunk {status['chunk_id']} nudged:    {status['chunk_nudged']}")
     return 0
 
 
@@ -263,7 +292,20 @@ def cmd_stats(args) -> int:
         print(json.dumps(s, indent=2))
         return 0
     for key, value in s.items():
+        if key == "citation_compliance":
+            continue
         print(f"{key:>20}: {_fmt_int(value)}")
+    cc = s["citation_compliance"]
+    print(
+        f"{'citation compliance':>20}: {cc['cited']}/{cc['queries']} of the last "
+        f"{cc['window']} queries cited"
+        + (f" ({cc['citation_rate']:.0%})" if cc["citation_rate"] is not None else "")
+    )
+    if cc["queries"] and cc["citation_rate"] is not None and cc["citation_rate"] < 1.0:
+        print(
+            "                      every uncited query is logged but never enters the "
+            "score-affecting path — see README 'Feedback'"
+        )
     return 0
 
 
@@ -354,10 +396,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="record a §6.2c regression-check outcome — see scripts/nudge-regression-check.md; never fabricate 'pass'",
     )
     n.add_argument("--notes", help="notes to attach to --record-check")
+    n.add_argument(
+        "--chunk", type=int, default=None,
+        help="also report this chunk_id's own per-chunk gate status (evidence count, whether it would be nudged)",
+    )
     n.add_argument("--json", action="store_true")
     n.set_defaults(func=cmd_nudge)
 
-    s = sub.add_parser("stats", help="what is in the index")
+    s = sub.add_parser("stats", help="what is in the index, plus citation compliance (recent `vdb feedback` follow-through)")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_stats)
 

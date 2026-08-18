@@ -67,7 +67,7 @@ default.
 python -m vdb index                 # build, or update only what changed
 python -m vdb index --rebuild       # start from empty
 python -m vdb index --root /path    # a different corpus root
-python -m vdb stats                 # what is in the index
+python -m vdb stats                 # what is in the index, plus citation compliance (see Feedback)
 python -m vdb boilerplate           # the template lines currently being trimmed
 ```
 
@@ -132,13 +132,22 @@ this module's whole reason filtering is a `WHERE` clause and not a second-pass r
   "margin": 12.4, "weak_signal": false, "nudge_applied": false,
   "hits": [ {"chunk_id": 1, "rank": 1, "score": 0.0, "text": "...",
              "session_id": "...", "project": "...", "role": "...", "ts": "...",
-             "part": 0, "n_parts": 1, "source": "...", "is_sidechain": false }, ... ]
+             "part": 0, "n_parts": 1, "source": "...", "is_sidechain": false }, ... ],
+  "citation_expected": true,
+  "citation_command": "vdb feedback 42 --used <chunk_id>[,<chunk_id>...]",
+  "citation_command_used_nothing": "vdb feedback 42 --used \"\"",
+  "citation_reminder": "citation is expected after every query you act on: ..."
 }
 ```
 
 Every hit carries project, role, timestamp, session id and source file — enough to cite the
 passage or go read the surrounding session deliberately. `query_id` is what you pass to `vdb
-feedback` (see "Feedback" below) — cite it if you act on a result.
+feedback` (see "Feedback" below). **Citation is expected after every query you act on** — both
+the human-readable and `--json` output say so on every call, every time, with the exact follow-up
+command already filled in (`citation_command`/`citation_command_used_nothing` in JSON); this is
+not a one-time thing to remember, it is printed again on every `vdb query` call because there is
+no way for this tool to enforce it across two separate CLI invocations. Check whether that's
+actually happening any time with `vdb stats` (below).
 
 Exit codes are stable and mean the same thing in every mode: **0** = the query ran and found at
 least one passage; **1** = the query ran and found nothing; **2** = the query could not run at
@@ -174,16 +183,26 @@ retrieval changes.**
 
 1. Every `vdb query` writes a `query_log` row and prints a `query_id`, whether or not
    you cite anything. This alone changes nothing about ranking.
-2. **If you act on a returned passage, cite it:**
+2. **If you act on a returned passage, cite it — every time, not just when convenient:**
    ```sh
    vdb feedback <query_id> --used <chunk_id>[,<chunk_id>...]
    vdb feedback <query_id> --used ""       # queried, used nothing — also a real signal
    ```
-   This is the single highest-leverage thing a calling agent can do here. An uncited
-   query is logged, never scored — it is not diluted as partial credit across the
-   results (report §4.2–§4.3: with recall@10 well under 100% even in the best filtered
-   condition, most of a typical top-k didn't matter even on a successful query, so
-   smearing credit across all of it would reward passages that merely rode along).
+   This is the single highest-leverage thing a calling agent can do here. `vdb query`
+   prints the exact command above (with `<query_id>` already filled in) on *every* call,
+   human and `--json` alike — a calling agent should not have to already know to cite,
+   it is told every time. An uncited query is logged, never scored — it is not diluted
+   as partial credit across the results (report §4.2–§4.3: with recall@10 well under
+   100% even in the best filtered condition, most of a typical top-k didn't matter even
+   on a successful query, so smearing credit across all of it would reward passages that
+   merely rode along). There is no inference-based fallback and there will not be one —
+   §4.3 already measured that diluted/guessed credit is worse than no signal.
+
+   **Check compliance any time with `vdb stats`** — it reports what fraction of the most
+   recent 200 `query_log` rows have a matching `feedback_citation` (`citation_compliance`
+   in `--json`). This is the visible signal that catches citation drift instead of
+   silently accepting it; a future session should check this before assuming the loop is
+   actually accumulating signal.
 3. A background pass (`vdb label`, installed as a second systemd timer alongside the
    indexer — see below) reads cited queries old enough for downstream evidence to exist,
    scans your own session's transcript forward for a confirm/correction signal (two
@@ -192,11 +211,21 @@ retrieval changes.**
    single-class labels ("mixed" — confirms one thing, corrects another — is recorded but
    never scored) update the per-chunk feedback counts.
 4. **The score-affecting nudge (a small, capped additive adjustment to BM25 scores) is
-   implemented but ships OFF**, and stays off — regardless of any flag — until 300
-   high-confidence cited labels exist *and* a regression check against the static eval
-   sets has been explicitly recorded as passed. `vdb nudge --json` reports live status;
-   `scripts/nudge-regression-check.md` documents the check. See `AGENTS.md` before ever
-   touching this.
+   implemented but ships OFF**, gated by two conditions that must *both* hold:
+   - **Global**: the operator flag, **60** high-confidence cited labels corpus-wide
+     (`store.NUDGE_LABEL_THRESHOLD` — reduced from the original 300; see that constant's
+     docstring for why 60 is the right floor, not just a smaller guess), and a regression
+     check against the static eval sets explicitly recorded as passed.
+   - **Per-chunk**: a given chunk's own score nudge only applies once *that chunk* has
+     earned at least **3** of its own high-confidence, cited labels
+     (`store.NUDGE_PER_CHUNK_MIN`) — a passage used constantly no longer has to wait on
+     the whole corpus's volume, but it still needs more than one citation before its own
+     evidence is trusted (see that constant's docstring for why 3, not 1 or 20).
+
+   Both gates apply independently; neither replaces the other. `vdb nudge --json` (add
+   `--chunk <id>` to inspect one chunk's own gate) reports live status;
+   `scripts/nudge-regression-check.md` documents the regression check. See `AGENTS.md`
+   before ever touching this.
 
 Attribution to "your own session" uses `$CLAUDE_CODE_SESSION_ID` (confirmed to match the
 transcript's own filename/`sessionId` — see `AGENTS.md`), captured automatically by
