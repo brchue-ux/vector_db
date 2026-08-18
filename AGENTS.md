@@ -8,8 +8,28 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 
 Local retrieval over the captain's own Claude Code history — **for an agent to call, not a human
 to search** (`vdb query`; no UI is planned, ever). Ingest, cleaning, message-boundary chunking,
-BM25, metadata pre-filtering, and a background indexer are built; see `README.md` for what it
-does and how to run it, and `vdb/*.py` module docstrings for why each rule exists.
+BM25, metadata pre-filtering, a background indexer, and implicit-feedback logging/citation/label
+extraction are built; see `README.md` for what it does and how to run it, and `vdb/*.py` module
+docstrings for why each rule exists.
+
+## The implicit-feedback learning loop
+
+Spec: `data/vdbfeedback/report.md` (outside this repo, never committed — describes the captain's
+private corpus). Logging (`query_log`), citation (`vdb feedback`), and heuristic label extraction
+(`vdb label`, a second systemd timer) are shipped and score-neutral. The score-affecting nudge
+(`vdb/store.py:score_nudge`, plugged into `BM25Retriever.search()`) is implemented but **must stay
+off**: `store.nudge_active()` is a real runtime gate requiring all three of (a) the operator flag
+(`vdb nudge --enable`), (b) **300** high-confidence, cited, non-held-out labels
+(`store.NUDGE_LABEL_THRESHOLD`), and (c) a regression check against the frozen `vdbqual`/
+`vdbtray`/`vdbaccuracy` static eval sets explicitly recorded as passed (`vdb nudge --record-check`,
+procedure in `scripts/nudge-regression-check.md`). **Do not flip `--enable` or record a `pass`
+without actually running that check** — recording a fabricated pass defeats the entire safeguard.
+`query_log.held_out` (~10% of queries, decided by hashing `query_id` at insert time) never
+contributes to `chunk_feedback` and is meant to become the running eval set for that check.
+
+Attribution uses `$CLAUDE_CODE_SESSION_ID` (verified to equal the transcript's own
+`sessionId`/filename stem — report §4.4's open question, resolved: yes, it's available), captured
+automatically by `vdb query` into `caller_session` unless `--caller-session` overrides it.
 
 ## The rules that are not negotiable by taste
 
@@ -48,10 +68,15 @@ and the intuitive alternative lost:**
 - Stdlib only, deliberately: BM25 comes from SQLite FTS5 (`bm25()` is Okapi with
   k1=1.2, b=0.75). Keep phase 1 dependency-free.
 - Tests: `python -m unittest discover -s tests -t .` (no pytest on this box).
-- Background indexing is a `systemd --user` timer (`scripts/install-timer.sh` /
-  `uninstall-timer.sh`, units in `systemd/`), not a daemon of its own. Installing/testing it for
-  real writes to `~/.config/systemd/user` and enables a real timer — don't run the install script
-  from a disposable worktree whose path won't survive; render/verify the unit files instead.
+- Background indexing and label extraction are two `systemd --user` timers
+  (`scripts/install-timer.sh` / `uninstall-timer.sh`, units in `systemd/`: `vdb-index` and
+  `vdb-label`), not a daemon of its own. Installing/testing it for real writes to
+  `~/.config/systemd/user` and enables real timers — don't run the install script from a
+  disposable worktree whose path won't survive; render/verify the unit files instead.
+- `vdb label`'s session-transcript lookup (`vdb/feedback.py:_find_session_transcript`) is an exact
+  `rglob` for `<session_id>.jsonl` under the corpus root — never "most recently modified file in
+  the project directory" (report Appendix A item 4: this corpus routinely has multiple concurrent
+  sessions per project directory, so that heuristic misattributes).
 
 ## Maintaining this file
 

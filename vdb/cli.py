@@ -1,4 +1,5 @@
-"""Command line: `vdb index`, `vdb query`, `vdb stats`, `vdb boilerplate`.
+"""Command line: `vdb index`, `vdb query`, `vdb feedback`, `vdb label`, `vdb
+nudge`, `vdb stats`, `vdb boilerplate`.
 
 The primary caller is an agent, not a human at a terminal - so `query --json`
 output is deterministic and machine-parseable, and exit codes are stable:
@@ -11,16 +12,25 @@ Delivery is an explicit command, by design. Report §13.2 makes this the
 load-bearing negative finding: retrieval cannot tell when it has found nothing
 (F6; re-measured for this retriever's own score in `vdb/retrieve.py`'s
 docstring), so it must be asked, never injected silently into a session.
+
+Every `query` prints a `query_id`. If you act on a returned passage, cite it
+with `vdb feedback <query_id> --used <chunk_id>[,...]` (an empty `--used` is
+a valid "queried, used nothing" signal) - this is the only thing that lets
+`vdb label`'s background pass (data/vdbfeedback/report.md §8 step 3) ever
+attribute a confirm/correction to a specific passage. Uncited queries are
+still logged, never scored.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import textwrap
 from pathlib import Path
 
+from . import feedback as feedback_mod
 from . import ingest as ingest_mod
 from . import retrieve, store
 
@@ -91,15 +101,37 @@ def cmd_query(args) -> int:
         print(str(exc), file=sys.stderr)
         return 2
 
+    caller_session = args.caller_session or os.environ.get("CLAUDE_CODE_SESSION_ID")
+    query_id = store.log_query(
+        conn,
+        query_text=result.query,
+        filters={
+            "project": args.project,
+            "role": args.role,
+            "session": args.session,
+            "since": args.since,
+            "until": args.until,
+            "include_sidechain": not args.no_sidechain,
+        },
+        k_requested=result.k_requested,
+        hit_chunk_ids=[h.chunk_id for h in result.hits],
+        hit_scores=[h.score for h in result.hits],
+        margin=result.margin,
+        weak_signal=result.weak_signal,
+        caller_session=caller_session,
+    )
+
     if args.json:
         print(
             json.dumps(
                 {
+                    "query_id": query_id,
                     "query": result.query,
                     "k_requested": result.k_requested,
                     "n_hits": len(result.hits),
                     "margin": result.margin,
                     "weak_signal": result.weak_signal,
+                    "nudge_applied": result.nudge_applied,
                     "hits": [h.__dict__ for h in result.hits],
                 },
                 indent=2,
@@ -110,6 +142,7 @@ def cmd_query(args) -> int:
     if not result.hits:
         print("no passages matched — this may mean the index has nothing on this, "
               "not that nothing on this exists (this system cannot tell the two apart).")
+        print(f"\nquery_id: {query_id}")
         return 1
     for hit in result.hits:
         body = hit.text if args.full else textwrap.shorten(
@@ -117,6 +150,7 @@ def cmd_query(args) -> int:
         )
         print(f"\n#{hit.rank}  score {hit.score:.3f}  [{hit.provenance()}]")
         print(f"    session {hit.session_id}")
+        print(f"    chunk_id {hit.chunk_id}")
         print(f"    {hit.source}")
         print(textwrap.indent(body, "    "))
     if result.margin is not None:
@@ -133,6 +167,92 @@ def cmd_query(args) -> int:
             "cannot reliably tell a good match from a mediocre one; read the "
             "passages, don't just trust the ranking)"
         )
+    print(
+        f"\nquery_id: {query_id}  — if you act on one of these passages, cite it: "
+        f"`vdb feedback {query_id} --used <chunk_id>[,<chunk_id>...]` (or "
+        f"`--used \"\"` if you queried but used none). This is what makes this "
+        f"index able to learn from real use — see README 'Feedback'."
+    )
+    return 0
+
+
+def cmd_feedback(args) -> int:
+    """`vdb feedback <query_id> --used <chunk_id>[,...]` (report §4.2, §8 step 2).
+
+    Citing what you used is what makes every later label mean something: an
+    uncited query is logged but never enters the score-affecting path (§4.3).
+    """
+    conn = store.connect(args.db)
+    used_ids = [int(x) for x in args.used.split(",") if x.strip()]
+    try:
+        store.record_citation(conn, args.query_id, used_ids)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps({"query_id": args.query_id, "used_chunk_ids": used_ids}))
+    elif used_ids:
+        print(f"recorded: query {args.query_id} used chunks {used_ids}")
+    else:
+        print(f"recorded: query {args.query_id} queried, used nothing")
+    return 0
+
+
+def cmd_label(args) -> int:
+    """Background pass (`vdb label`, report §8 step 3) - install via the systemd
+    --user timer (`scripts/install-timer.sh`), not run by hand as a daemon."""
+    conn = store.connect(args.db)
+    st = feedback_mod.run_label_pass(
+        conn,
+        root=Path(args.root),
+        min_age_seconds=args.min_age_seconds,
+        max_lookahead=args.max_lookahead,
+    )
+    if args.json:
+        print(json.dumps(st.as_dict(), indent=2))
+    elif not args.quiet:
+        print(
+            f"scanned {_fmt_int(st.scanned)} cited queries · labelled {_fmt_int(st.labeled)} "
+            f"({st.by_label}) · too young {_fmt_int(st.skipped_too_young)} · "
+            f"no session found {_fmt_int(st.skipped_no_session)} · "
+            f"no evidence yet {_fmt_int(st.skipped_no_evidence)}"
+        )
+    return 0
+
+
+def cmd_nudge(args) -> int:
+    """Status and control for the score-affecting nudge's runtime gate (report §6.3).
+
+    Setting `--enable` only flips the operator flag - `store.nudge_active()`
+    still requires the 300-label volume threshold AND a recorded passing
+    regression check (`--record-check`) before the nudge actually does
+    anything. See `scripts/nudge-regression-check.md` before ever recording
+    a pass.
+    """
+    conn = store.connect(args.db)
+    if args.enable:
+        store.set_nudge_flag(conn, True)
+    elif args.disable:
+        store.set_nudge_flag(conn, False)
+    elif args.record_check:
+        store.record_regression_check(
+            conn, passed=(args.record_check == "pass"), notes=args.notes or ""
+        )
+
+    status = {
+        "flag_enabled": store.nudge_flag_enabled(conn),
+        "qualifying_labels": store.qualifying_label_count(conn),
+        "threshold": store.NUDGE_LABEL_THRESHOLD,
+        "regression_check": store.regression_check_status(conn),
+        "active": store.nudge_active(conn),
+    }
+    if args.json:
+        print(json.dumps(status, indent=2))
+    else:
+        print(f"flag enabled:       {status['flag_enabled']}")
+        print(f"qualifying labels:  {status['qualifying_labels']} / {status['threshold']}")
+        print(f"regression check:   {status['regression_check']}")
+        print(f"NUDGE ACTIVE:       {status['active']}")
     return 0
 
 
@@ -188,8 +308,54 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--no-sidechain", action="store_true", help="exclude subagent transcripts")
     q.add_argument("--full", action="store_true", help="print whole passages, not excerpts")
     q.add_argument("--width", type=int, default=400, help="excerpt width (default 400)")
+    q.add_argument(
+        "--caller-session",
+        help="your own Claude Code session id, for feedback attribution (report §4.4); "
+        "defaults to $CLAUDE_CODE_SESSION_ID when unset — usually no need to pass this",
+    )
     q.add_argument("--json", action="store_true")
     q.set_defaults(func=cmd_query)
+
+    f = sub.add_parser(
+        "feedback",
+        help="report which returned chunk(s) you used — cite this every time you act on a result",
+    )
+    f.add_argument("query_id", type=int)
+    f.add_argument(
+        "--used",
+        required=True,
+        help='comma-separated chunk_ids you used, or "" if you queried and used none',
+    )
+    f.add_argument("--json", action="store_true")
+    f.set_defaults(func=cmd_feedback)
+
+    l = sub.add_parser(
+        "label",
+        help="background pass: extract confirm/correction labels from downstream conversation",
+    )
+    l.add_argument("--root", default=str(ingest_mod.DEFAULT_ROOT), help="corpus root (read-only)")
+    l.add_argument(
+        "--min-age-seconds", type=int, default=feedback_mod.DEFAULT_MIN_AGE_SECONDS,
+        help="how long to wait for downstream evidence before giving up",
+    )
+    l.add_argument(
+        "--max-lookahead", type=int, default=feedback_mod.DEFAULT_MAX_LOOKAHEAD,
+        help="how many of the caller's own user-role turns to scan forward",
+    )
+    l.add_argument("--json", action="store_true")
+    l.add_argument("-q", "--quiet", action="store_true")
+    l.set_defaults(func=cmd_label)
+
+    n = sub.add_parser("nudge", help="status/control for the score-affecting feedback nudge (default: inert)")
+    n.add_argument("--enable", action="store_true", help="set the operator flag (does not by itself activate the nudge)")
+    n.add_argument("--disable", action="store_true", help="clear the operator flag")
+    n.add_argument(
+        "--record-check", choices=["pass", "fail"], default=None,
+        help="record a §6.2c regression-check outcome — see scripts/nudge-regression-check.md; never fabricate 'pass'",
+    )
+    n.add_argument("--notes", help="notes to attach to --record-check")
+    n.add_argument("--json", action="store_true")
+    n.set_defaults(func=cmd_nudge)
 
     s = sub.add_parser("stats", help="what is in the index")
     s.add_argument("--json", action="store_true")
