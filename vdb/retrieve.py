@@ -11,9 +11,14 @@ fusion function combines two ranked lists. Nothing more is built for it here.
 
 The same seam also carries the implicit-feedback score nudge
 (data/vdbfeedback/report.md §5.3, outside this repo): a capped additive
-adjustment from `store.chunk_feedback`, gated by `store.nudge_active()` and
-shipped OFF (see that function's docstring for the three conditions it
-requires). Below the gate it never reads `chunk_feedback` at all.
+adjustment from `store.chunk_feedback`, gated by TWO conditions that must
+both hold - `store.nudge_active()` (global: flag + corpus-wide volume floor +
+recorded regression check) and, per hit, `store.score_nudge()`'s own
+`NUDGE_PER_CHUNK_MIN` check (that specific chunk's own accumulated evidence).
+Shipped OFF by the global gate (see `store.nudge_active()`'s docstring).
+Below the global gate this block never reads `chunk_feedback` at all; above
+it, `score_nudge()` still returns 0.0 for any chunk that hasn't individually
+earned it.
 
 No confidence gate is applied - and there is not a strong enough measured
 signal to build one on. Report F6 found absolute similarity carries no usable
@@ -198,12 +203,15 @@ class BM25Retriever:
 
         # Implicit-feedback score nudge (data/vdbfeedback/report.md §5.3), the
         # seam this module's own docstring reserves for a second retriever.
-        # `nudge_active()` is the real runtime gate (report §6.3): below the
-        # 300-label threshold, or with the flag off, or with no recorded
-        # passing regression check, this block does not run at all - the
-        # nudge is provably inert, not just defaulted off. When it does run,
-        # it only reorders the already-fetched top-k (never pulls in
-        # candidates BM25 itself did not return), keeping its influence
+        # `nudge_active()` is the GLOBAL runtime gate (report §6.3): below
+        # the corpus-wide label threshold, or with the flag off, or with no
+        # recorded passing regression check, this block does not run at all
+        # - the nudge is provably inert, not just defaulted off. When it does
+        # run, `score_nudge()` still applies the PER-CHUNK gate itself
+        # (`store.NUDGE_PER_CHUNK_MIN`), so a hit whose own chunk hasn't
+        # individually earned it gets +0.0 even while `nudge_applied` is
+        # True. It only ever reorders the already-fetched top-k (never pulls
+        # in candidates BM25 itself did not return), keeping its influence
         # bounded as documented in `store.NUDGE_WEIGHT`/`NUDGE_CAP`.
         nudged = False
         if hits and store_mod.nudge_active(self.conn):

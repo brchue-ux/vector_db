@@ -339,7 +339,8 @@ class ScoreNudgeCap(FeedbackBase):
         self.assertAlmostEqual(beyond_cap, expected_capped)
 
     def test_corrections_push_the_nudge_negative(self):
-        store.apply_feedback_to_chunks(self.conn, [5], "correction")
+        for _ in range(store.NUDGE_PER_CHUNK_MIN):
+            store.apply_feedback_to_chunks(self.conn, [5], "correction")
         self.assertLess(store.score_nudge(self.conn, 5), 0.0)
 
     def test_confirms_and_corrections_partially_offset(self):
@@ -437,6 +438,68 @@ class NudgeGate(FeedbackBase):
         boosted = retrieve.BM25Retriever(self.conn).search("widget calibration")
         self.assertTrue(boosted.nudge_applied)
         self.assertEqual(boosted.hits[0].chunk_id, loser)
+
+
+class PerChunkGate(FeedbackBase):
+    """Change 2: the per-chunk gate is a second, independent condition -
+    neither it nor the global gate substitutes for the other."""
+
+    def _satisfy_global_gate(self):
+        for i in range(store.NUDGE_LABEL_THRESHOLD):
+            qid = self.log_query(hit_chunk_ids=[900 + i])
+            self.conn.execute("UPDATE query_log SET held_out=0 WHERE id=?", (qid,))
+            store.record_citation(self.conn, qid, [900 + i])
+            store.write_label(self.conn, qid, "confirm", "heuristic_casual_v1", 1)
+            store.apply_feedback_to_chunks(self.conn, [900 + i], "confirm")
+        self.conn.commit()
+        store.set_nudge_flag(self.conn, True)
+        store.record_regression_check(self.conn, passed=True, notes="ok")
+        self.assertTrue(store.nudge_active(self.conn))
+
+    def test_chunk_label_count_reflects_accumulated_evidence(self):
+        self.assertEqual(store.chunk_label_count(self.conn, 1), 0)
+        store.apply_feedback_to_chunks(self.conn, [1], "confirm")
+        store.apply_feedback_to_chunks(self.conn, [1], "correction")
+        self.assertEqual(store.chunk_label_count(self.conn, 1), 2)
+
+    def test_below_per_chunk_threshold_stays_unnudged_even_with_global_gate_satisfied(self):
+        self._satisfy_global_gate()
+        for _ in range(store.NUDGE_PER_CHUNK_MIN - 1):
+            store.apply_feedback_to_chunks(self.conn, [1], "confirm")
+        self.assertLess(store.chunk_label_count(self.conn, 1), store.NUDGE_PER_CHUNK_MIN)
+        self.assertEqual(store.score_nudge(self.conn, 1), 0.0)
+
+    def test_above_per_chunk_threshold_gets_nudged_once_global_gate_satisfied(self):
+        self._satisfy_global_gate()
+        for _ in range(store.NUDGE_PER_CHUNK_MIN):
+            store.apply_feedback_to_chunks(self.conn, [1], "confirm")
+        self.assertGreaterEqual(store.chunk_label_count(self.conn, 1), store.NUDGE_PER_CHUNK_MIN)
+        self.assertGreater(store.score_nudge(self.conn, 1), 0.0)
+
+    def test_global_gate_unsatisfied_blocks_everything_regardless_of_per_chunk_count(self):
+        # Plenty of per-chunk evidence, but the global gate (flag / volume /
+        # regression check) was never satisfied - `nudge_active()` must stay
+        # False, and `BM25Retriever.search()` must not apply any nudge at all,
+        # even though `score_nudge()` alone would return a nonzero value.
+        for _ in range(store.NUDGE_PER_CHUNK_MIN * 5):
+            store.apply_feedback_to_chunks(self.conn, [1], "confirm")
+        self.assertGreater(store.score_nudge(self.conn, 1), 0.0)
+        self.assertFalse(store.nudge_active(self.conn))
+
+        fx.write_transcript(
+            self.root, "p", "s", [fx.user_entry("a distinctive query term appears here")]
+        )
+        store.index(self.conn, root=self.root)
+        chunk_id = self.conn.execute("SELECT id FROM chunks LIMIT 1").fetchone()["id"]
+        for _ in range(store.NUDGE_PER_CHUNK_MIN * 5):
+            store.apply_feedback_to_chunks(self.conn, [chunk_id], "confirm")
+
+        result = retrieve.BM25Retriever(self.conn).search("distinctive query term")
+        self.assertFalse(result.nudge_applied)
+        raw_row = self.conn.execute(
+            "SELECT -bm25(chunks_fts) AS s FROM chunks_fts WHERE rowid=?", (chunk_id,)
+        ).fetchone()
+        self.assertAlmostEqual(result.hits[0].score, round(raw_row["s"], 4))
 
 
 if __name__ == "__main__":

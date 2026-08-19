@@ -45,11 +45,17 @@ python -m vdb nudge --record-check fail --notes "family Q recall@10 dropped 0.56
 ```
 
 This writes to the `meta` table in the index database (report §6.2c is a
-runtime gate, not documentation) and is one of three conditions
-`store.nudge_active()` requires — see that function's docstring. Recording
-`fail` is exactly as valid an outcome as `pass`; it is what stops a bad
-change from ever reaching `nudge_active()`.
+runtime gate, not documentation) and is one of three conditions in the
+GLOBAL half of the gate that `store.nudge_active()` requires — see that
+function's docstring (a PER-CHUNK gate, `store.NUDGE_PER_CHUNK_MIN`, applies
+on top of this and is unaffected by it). Recording `fail` is exactly as
+valid an outcome as `pass`; it is what stops a bad change from ever reaching
+`nudge_active()`.
 
-`vdb nudge --enable` (the separate operator flag) and a `pass`-recorded
-regression check and 300+ qualifying labels are all three required —
-missing any one of them keeps the nudge inert, provably, at query time.
+`vdb nudge --enable` (the separate operator flag), a `pass`-recorded
+regression check, and `store.NUDGE_LABEL_THRESHOLD`+ (60+) qualifying labels
+corpus-wide are all three required for the GLOBAL gate — missing any one of
+them keeps the nudge inert, provably, at query time. A specific chunk also
+needs its own `store.NUDGE_PER_CHUNK_MIN` (3+) labels before it is nudged,
+independently of the global gate being satisfied — see `AGENTS.md` and
+`vdb/store.py`'s docstrings for both numbers.

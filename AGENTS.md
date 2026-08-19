@@ -16,16 +16,40 @@ docstrings for why each rule exists.
 
 Spec: `data/vdbfeedback/report.md` (outside this repo, never committed — describes the captain's
 private corpus). Logging (`query_log`), citation (`vdb feedback`), and heuristic label extraction
-(`vdb label`, a second systemd timer) are shipped and score-neutral. The score-affecting nudge
-(`vdb/store.py:score_nudge`, plugged into `BM25Retriever.search()`) is implemented but **must stay
-off**: `store.nudge_active()` is a real runtime gate requiring all three of (a) the operator flag
-(`vdb nudge --enable`), (b) **300** high-confidence, cited, non-held-out labels
-(`store.NUDGE_LABEL_THRESHOLD`), and (c) a regression check against the frozen `vdbqual`/
-`vdbtray`/`vdbaccuracy` static eval sets explicitly recorded as passed (`vdb nudge --record-check`,
-procedure in `scripts/nudge-regression-check.md`). **Do not flip `--enable` or record a `pass`
-without actually running that check** — recording a fabricated pass defeats the entire safeguard.
-`query_log.held_out` (~10% of queries, decided by hashing `query_id` at insert time) never
-contributes to `chunk_feedback` and is meant to become the running eval set for that check.
+(`vdb label`, a second systemd timer) are shipped and score-neutral.
+
+**Citation is expected after every `vdb query` call that gets acted on**, not an optional
+afterthought: `vdb query`'s human and `--json` output both print the exact `vdb feedback
+<query_id> --used ...` follow-up on every call (this cannot be enforced across two separate CLI
+invocations, so the tool insists loudly instead). Check whether that's actually happening with
+`vdb stats` (`store.citation_compliance()`) — the fraction of the most recent 200 `query_log` rows
+with a matching `feedback_citation`. There is no inference-based fallback for a missing citation
+and there will not be one — the report's §4.3 already measured diluted/guessed credit as worse
+than no signal.
+
+The score-affecting nudge (`vdb/store.py:score_nudge`, plugged into `BM25Retriever.search()`) is
+implemented but **must stay off**, gated by two independent conditions that must *both* hold:
+
+- **Global** (`store.nudge_active()`, a property of the whole retrieval system): the operator flag
+  (`vdb nudge --enable`), **60** high-confidence, cited, non-held-out labels corpus-wide
+  (`store.NUDGE_LABEL_THRESHOLD` — reduced from the report's original 300 now that a second,
+  per-chunk gate also exists; 60 is not a new guess, it is the same floor the report's own §6.3
+  already names as trustworthy — `vdbqual`'s smallest reliable family, C, n=60 — for "there is
+  enough data for the regression check to mean something"), and a regression check against the
+  frozen `vdbqual`/`vdbtray`/`vdbaccuracy` static eval sets explicitly recorded as passed (`vdb
+  nudge --record-check`, procedure in `scripts/nudge-regression-check.md`).
+- **Per-chunk** (`store.score_nudge()`'s own check): a given `chunk_id` only gets nudged once
+  *that chunk* has earned at least **3** of its own high-confidence, cited, non-held-out labels
+  (`store.NUDGE_PER_CHUNK_MIN`) — see that constant's docstring for why 3 (a single citation
+  already produces a small nonzero nudge under the capped-log formula, so the threshold's job is
+  requiring basic multiplicity, not blocking the first data point). Below its own threshold, a
+  chunk is not nudged at all — `score' = score` — even once the global gate is satisfied.
+  `vdb nudge --chunk <id>` inspects one chunk's own gate.
+
+**Do not flip `--enable` or record a `pass` without actually running that check** — recording a
+fabricated pass defeats the entire safeguard. `query_log.held_out` (~10% of queries, decided by
+hashing `query_id` at insert time) never contributes to `chunk_feedback` and is meant to become
+the running eval set for that check.
 
 Attribution uses `$CLAUDE_CODE_SESSION_ID` (verified to equal the transcript's own
 `sessionId`/filename stem — report §4.4's open question, resolved: yes, it's available), captured
