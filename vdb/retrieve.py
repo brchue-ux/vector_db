@@ -20,20 +20,24 @@ Below the global gate this block never reads `chunk_feedback` at all; above
 it, `score_nudge()` still returns 0.0 for any chunk that hasn't individually
 earned it.
 
-No confidence gate is applied - and there is not a strong enough measured
-signal to build one on. Report F6 found absolute similarity carries no usable
-signal (AUC 0.551) and the rank-1-to-rank-10 margin does better (AUC 0.724) -
-but that was measured for a bounded dense cosine score, not for this
-retriever. Re-measured directly for BM25's own unbounded `-bm25()` score (the
-`vdbtray` chunk-granularity harness, reused for this question): AUC(top1
-score) = 0.530, 95% CI [0.480, 0.582] (still no usable signal, same
-conclusion as F6) and AUC(margin) = 0.645, 95% CI [0.598, 0.690] (real, but
-distinctly weaker than the dense 0.724 - the hit and miss margin distributions
-overlap substantially). `search()` reports the margin as a diagnostic and lets
-the caller judge; it is deliberately not thresholded into a verdict, because
-0.645 is not strong enough evidence to hang a hard cutoff on without it
-misfiring often (`vdbqual` O13 remains open). Retrieval is never injected
-automatically (§13.2) - it is asked for.
+Report F6 found absolute similarity carries no usable signal (AUC 0.551) and
+the rank-1-to-rank-10 margin does better (AUC 0.724) - but that was measured
+for a bounded dense cosine score, not for this retriever. Re-measured directly
+for BM25's own unbounded `-bm25()` score (the `vdbtray` chunk-granularity
+harness, reused for this question): AUC(top1 score) = 0.530, 95% CI
+[0.480, 0.582] (still no usable signal, same conclusion as F6) and
+AUC(margin) = 0.645, 95% CI [0.598, 0.690] (real, but distinctly weaker than
+the dense 0.724 - the hit and miss margin distributions overlap
+substantially).
+
+`Result.confidence` (vdbconfidence task, O13) turns that margin into a
+calibrated three-way label instead of a fixed threshold - see this module's
+`confidence_band()` docstring for the calibration measurement (four query
+families rebuilt against the live corpus, 565 scored queries) and for the
+real family-pooling confound that measurement surfaced along the way. It is a
+label on top of the existing ranking, not a change to it - `search()`'s
+ordering and scores are unaffected. Retrieval is never injected automatically
+(§13.2) - it is asked for.
 """
 
 from __future__ import annotations
@@ -101,9 +105,122 @@ class Result:
         hits than requested (the index has thin coverage for this query). This
         is deliberately NOT based on a margin or score cutoff - the measured
         AUC (0.645) isn't strong enough evidence to invent a numeric threshold
-        that would misfire silently. See this module's docstring.
+        that would misfire silently. See this module's docstring. Independent
+        of `confidence` below - a full result set can still be low-confidence,
+        and this flag is untouched by that addition.
         """
         return len(self.hits) < 2 or len(self.hits) < self.k_requested
+
+    @property
+    def confidence(self) -> str:
+        """The calibrated three-way confidence label for this result's shape.
+
+        Thin wrapper around `confidence_band(self.margin)` - see that
+        function's docstring for the calibration measurement, the bands'
+        measured hit rates, and why three bands rather than a numeric score.
+        """
+        return confidence_band(self.margin)
+
+
+CONFIDENT = "confident"
+UNCERTAIN = "uncertain"
+LOW_CONFIDENCE = "low_confidence"
+
+# Calibrated on real per-query top-10 score shapes (vdbconfidence task, O13):
+# vdbqual Appendix B's four query families (M/Q/C/T) were rebuilt against the
+# live corpus at the shipped msg1000 BM25 config and scored - 565 queries,
+# pooled hit@10 rate 68.5% (M 137/1.000, Q 228/0.465, C 60/0.333, T 140/0.886;
+# family sizes replicate vdbtray's harness almost exactly - vdbtray got
+# 137/259/60/140 on its own snapshot of this same corpus).
+#
+# Several shape descriptors were compared by AUC before picking one - not a
+# rubber stamp of `Result.margin`: the plain rank1-rank10 margin already used
+# there (AUC 0.647), the raw rank1-rank2 gap (0.612), that gap normalised by
+# the top score (0.560), a normalised score-decay-curve area (0.611), and the
+# rank-1 z-score against the rank2-10 tail's own mean/sd (0.462, WORSE than
+# chance). Plain margin won; nothing tried beat it.
+#
+# That AUC was NOT computed on all 565 queries pooled - doing so inverts the
+# sign (pooled AUC 0.385, margin appearing to predict a MISS). Diagnosed, not
+# papered over: family M is always a hit (no negative examples, contributes
+# no discriminative information) and family T's gold is session-level ("any
+# chunk from this session counts") - generous enough that a genuine hit does
+# not need a peaked score curve. T's own within-family AUC is a strong 0.850,
+# but its typical hit margin sits far below Q/C's typical MISS margin, so
+# mixing the four families flips the pooled sign even though the relationship
+# is positive within every one of them. This is Simpson's paradox from
+# combining populations with different baseline score scales, not a bug in
+# the harness - and it is itself the reason this gate is calibrated on
+# families Q and C only (n=288, hit rate 43.8%): the two families whose gold
+# means "this specific passage is the answer", not "something from the right
+# session showed up" - vdbqual §2.2 names Q the family it weights most when
+# families disagree, for exactly that specific-passage-gold reason; C's own
+# gold (§2.3) is built the same way even though §2.2 doesn't say so about C
+# by name. AUC(margin) on that population = 0.647, 95% CI
+# [0.584, 0.709] - matching vdbtray's own pooled BM25 margin AUC (0.645,
+# n=596) closely, which is reassuring given the two measurements used
+# different query samples on a corpus that kept growing between them.
+#
+# Practical upshot: this gate was calibrated on, and is most trustworthy for,
+# specific-answer-recall-shaped queries. A broad "have we talked about X"
+# query is closer to family T's shape, where this same margin threshold does
+# not carry the same meaning - stated plainly in the README/CLI help, not
+# just here.
+#
+# Cut points are the terciles of that Q+C margin distribution, not round
+# numbers - each band's measured hit rate (3,000-resample bootstrap 95% CI):
+#   margin <  75.0            -> low_confidence:  28.1% hit  [18.9%, 37.4%]
+#   75.0 <= margin < 126.0    -> uncertain:        44.7% hit  [34.7%, 54.4%]
+#   margin >= 126.0           -> confident:        58.2% hit  [48.1%, 67.7%]
+# Adjacent bands' intervals overlap - this is a real but noisy signal, same
+# conclusion as the AUC. Three bands, not a numeric score: the calibration
+# does not support finer distinctions without manufacturing false precision
+# (see README "Confidence" before trusting a number this measurement can't
+# back up).
+CONFIDENCE_LOW_MARGIN = 75.0
+CONFIDENCE_HIGH_MARGIN = 126.0
+
+
+def confidence_band(margin: float | None) -> str:
+    """Calibrated three-way confidence label for one query's score margin.
+
+    Not a verdict and not a substitute for reading the passages - even the
+    `confident` band's measured hit rate (58.2%) is well under certainty. See
+    the module-level comment above `CONFIDENCE_LOW_MARGIN` for the
+    calibration this is built on, including the family-pooling confound it
+    surfaced and why it is fit on families Q and C rather than the whole
+    corpus of query shapes.
+
+    `margin=None` (fewer than two hits - the same condition `weak_signal`
+    already flags) has no shape to compare and is `low_confidence` by
+    definition, not by extrapolation.
+    """
+    if margin is None or margin < CONFIDENCE_LOW_MARGIN:
+        return LOW_CONFIDENCE
+    if margin < CONFIDENCE_HIGH_MARGIN:
+        return UNCERTAIN
+    return CONFIDENT
+
+
+# The measured hit rate behind each band, for callers to print alongside the
+# label so nobody has to take "confident" on faith - the whole point of
+# calibrating this rather than shipping an unqualified word.
+CONFIDENCE_EXPLANATION = {
+    CONFIDENT: (
+        "measured hit rate 58% (95% CI 48-68%) on the calibration set - real "
+        "signal, still well under certainty; read the passage, don't skip it"
+    ),
+    UNCERTAIN: (
+        "measured hit rate 45% (95% CI 35-54%) - close to a coin flip; the "
+        "score shape doesn't clearly look like a hit or a miss"
+    ),
+    LOW_CONFIDENCE: (
+        "measured hit rate 28% (95% CI 19-37%) on queries with this shape - "
+        "usually a miss, but not certain; still worth a glance if nothing else "
+        "turned up. (With fewer than two results there is no shape to measure "
+        "at all, and this band applies by definition, not by that measurement.)"
+    ),
+}
 
 
 def match_expression(question: str) -> str:

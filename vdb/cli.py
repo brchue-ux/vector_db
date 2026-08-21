@@ -13,6 +13,12 @@ load-bearing negative finding: retrieval cannot tell when it has found nothing
 (F6; re-measured for this retriever's own score in `vdb/retrieve.py`'s
 docstring), so it must be asked, never injected silently into a session.
 
+Every `query` also prints a calibrated `confidence` label (`confident` /
+`uncertain` / `low_confidence`, `retrieve.confidence_band()`) alongside the
+results. It is a label on the existing ranking, not a change to it - a
+measured but noisy signal (see that function's docstring for the calibration
+and its own honest limits), never a substitute for reading the passages.
+
 Every `query` prints a `query_id` AND the exact citation follow-up command,
 every single time, in both human and `--json` output - this cannot be
 enforced across two separate CLI invocations, so the tool insists loudly
@@ -145,6 +151,8 @@ def cmd_query(args) -> int:
                     "n_hits": len(result.hits),
                     "margin": result.margin,
                     "weak_signal": result.weak_signal,
+                    "confidence": result.confidence,
+                    "confidence_note": retrieve.CONFIDENCE_EXPLANATION[result.confidence],
                     "nudge_applied": result.nudge_applied,
                     "hits": [h.__dict__ for h in result.hits],
                     "citation_expected": True,
@@ -160,6 +168,7 @@ def cmd_query(args) -> int:
     if not result.hits:
         print("no passages matched — this may mean the index has nothing on this, "
               "not that nothing on this exists (this system cannot tell the two apart).")
+        print(f"\nconfidence: {result.confidence}  — {retrieve.CONFIDENCE_EXPLANATION[result.confidence]}")
         print(f"\nquery_id: {query_id}  — {citation_reminder}")
         return 1
     for hit in result.hits:
@@ -173,18 +182,17 @@ def cmd_query(args) -> int:
         print(textwrap.indent(body, "    "))
     if result.margin is not None:
         print(f"\nrank1–rank{min(10, len(result.hits))} margin: {result.margin}")
+    print(f"confidence: {result.confidence}  — {retrieve.CONFIDENCE_EXPLANATION[result.confidence]}")
     if result.weak_signal:
         print(
             "weak signal: fewer results than usual for this index — treat these "
             "passages with more caution than a full, well-separated result set "
-            "(this is a structural flag, not a validated confidence score; see README)"
+            "(this is a structural flag, independent of confidence above; see README)"
         )
-    else:
-        print(
-            "(the margin above is a diagnostic, not a verdict — this system "
-            "cannot reliably tell a good match from a mediocre one; read the "
-            "passages, don't just trust the ranking)"
-        )
+    print(
+        "(confidence is a calibrated but noisy signal, not a verdict — read the "
+        "passages, don't just trust the label; see README 'Confidence')"
+    )
     print(f"\nquery_id: {query_id}  — {citation_reminder}")
     return 0
 
