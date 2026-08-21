@@ -9,8 +9,10 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 Local retrieval over the captain's own Claude Code history — **for an agent to call, not a human
 to search** (`vdb query`; no UI is planned, ever). Ingest, cleaning, message-boundary chunking,
 BM25, metadata pre-filtering, a background indexer, implicit-feedback logging/citation/label
-extraction, and a calibrated confidence gate on every result are built; see `README.md` for what
-it does and how to run it, and `vdb/*.py` module docstrings for why each rule exists.
+extraction, a calibrated confidence gate on every BM25-only result, and (phase 2) a dense
+(`multilingual-e5-large`) retriever fused with BM25 by reciprocal-rank fusion behind
+`vdb query --hybrid` are built; see `README.md` for what it does and how to run it, and
+`vdb/*.py` module docstrings for why each rule exists.
 
 ## The implicit-feedback learning loop
 
@@ -54,6 +56,35 @@ the running eval set for that check.
 Attribution uses `$CLAUDE_CODE_SESSION_ID` (verified to equal the transcript's own
 `sessionId`/filename stem — report §4.4's open question, resolved: yes, it's available), captured
 automatically by `vdb query` into `caller_session` unless `--caller-session` overrides it.
+
+## Dense retrieval (phase 2)
+
+Model and fusion mechanism are both settled by prior research, not open to re-litigating without
+re-running the eval: `multilingual-e5-large` (`data/decisions/vdbqual-decision-embedding-model-cost.md`,
+outside this repo) fused with BM25 by reciprocal-rank fusion, `vdbqual` §11.4's exact measured
+formula (`vdb/retrieve.py:RRF_K = 60`, `reciprocal_rank_fusion()`) — not a score-blend, not a
+learned combiner. Storage is plain SQLite BLOBs + a brute-force `numpy` scan (`vdb/dense.py`,
+`DenseRetriever`), not `sqlite-vec` — `vdbscout`'s storage-options finding is that both are fast
+enough at this corpus's scale and brute force avoids a compiled-extension dependency. See
+README "Dense index" for the full reasoning and the real-corpus indexing command.
+
+`fastembed`/`onnxruntime`/`numpy` are an **optional extra** (`pyproject.toml`'s
+`[project.optional-dependencies] dense`), imported lazily only from `vdb/dense.py` and the
+`--hybrid`/`dense-index` CLI paths — `vdb query`/`vdb index` and everything else never import
+them, importable or not. `tests/test_dense.py` mirrors this: classes that call
+`DenseRetriever`/`HybridRetriever.search()` (which lazily `import numpy`) are decorated
+`@unittest.skipUnless(HAS_NUMPY, ...)` so the base suite stays green without the extra
+installed; everything else (RRF math, vector packing, `dense.build_index` with the test's
+`FakeEmbedder`) needs no numpy at all and always runs.
+
+Two decisions made explicitly for this phase, both documented in code and README, neither a
+silent default:
+- **The feedback nudge stays BM25-only.** `DenseRetriever` never reads `chunk_feedback`;
+  `HybridRetriever` doesn't add a nudge of its own, though BM25's own nudge (when the global
+  gate above is active) still shapes the BM25 half of a fused ranking.
+- **`Result.confidence` is `retrieve.UNCALIBRATED` for any non-BM25-only ranking**, never the
+  BM25-fit bands — the calibration in "The rules that are not negotiable by taste" below was fit
+  on raw BM25 margins specifically and does not transfer to a cosine or RRF score gap.
 
 ## The rules that are not negotiable by taste
 
@@ -107,6 +138,17 @@ and the intuitive alternative lost:**
   `rglob` for `<session_id>.jsonl` under the corpus root — never "most recently modified file in
   the project directory" (report Appendix A item 4: this corpus routinely has multiple concurrent
   sessions per project directory, so that heuristic misattributes).
+- `vdb dense-index` on the real corpus is a many-hour job (README "Dense index" has the current
+  measured throughput and why it's noisy) — never run it synchronously; it belongs backgrounded
+  (`nohup ... & disown`), logging to `$XDG_DATA_HOME/vdb/dense-index.log`. Same caution as the
+  systemd install script above applies for the same reason: a disposable worktree's `.venv` and
+  checkout path won't survive after the worktree is reclaimed, so a long dense-index run kicked
+  off from one depends on that worktree persisting until it finishes — check
+  `python -m vdb dense-index --status` and relaunch from a persistent checkout if it didn't.
+- fastembed's `intfloat/multilingual-e5-large` needs the `"query: "`/`"passage: "` prefix
+  applied by hand (`vdb/dense.py`) — fastembed does not add it automatically for this model,
+  unlike some others in its registry. Vectors are stored L2-normalized so `DenseRetriever`'s
+  search can use a plain dot product instead of computing cosine similarity per query.
 
 ## Maintaining this file
 
