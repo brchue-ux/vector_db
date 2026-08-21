@@ -109,13 +109,12 @@ anything, as a SQL `WHERE`, not as a post-hoc trim of the top-k:
 | speaker | `--role {user,assistant,memory}` | exact match |
 | sidechain transcripts | `--no-sidechain` | excludes subagent transcripts (included by default) |
 
-**A rough date-window filter is not a safe default for "have we discussed this before"
-queries.** `vdbaccuracy` §3.5/§5.1 measured that for the cross-session recall family
-(the gold passage displaced in time, not near the question), date-window filtering
-*hurts* — the whole premise of that family is that the answer isn't where you'd guess
-to narrow to. Date filtering helps other families (a known, recent window). Reach for
-`--since`/`--until` when you have a real reason to believe the answer is in that
-window, not as a default "narrow it down" move.
+**Narrowing by project is close to a universal win, but a rough or guessed date-window
+filter is not a safe default.** Date filtering helps when a query is naturally time-scoped,
+but `vdbaccuracy` §3.5 measured that it *hurts* cross-session "have we discussed this
+before" questions: the whole premise is that the answer is displaced in time from when it
+is being asked about. A calling agent that is not sure which kind of question it is answering
+should narrow by project, but should not reach for `--since`/`--until` by default.
 
 Report §11.3 measured that embedding this same information *into the chunk text* makes retrieval
 worse (a −0.041 recall@10 cost for a two-line header alone) — so it is never in the indexed text.
