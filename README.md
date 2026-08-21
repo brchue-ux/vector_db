@@ -7,13 +7,16 @@ conversation. There is deliberately no UI and no visual app here, and none is pl
 consumer is an agent, not a human doing his own searching.
 
 **Status: phase 1 + the agent-facing tool + implicit-feedback logging + a calibrated confidence
-gate shipped.** Ingest, cleaning, message-boundary chunking, a BM25 keyword index, metadata
-pre-filtering, a deterministic agent-callable query command, a background indexer, query/
-citation/label logging for an implicit-feedback loop (`vdb feedback`, `vdb label`, its
-score-affecting nudge built but shipped off — see "Feedback" below), and a calibrated
-`confident`/`uncertain`/`low_confidence` label on every result (see "Confidence" below). No model,
-no vectors, no network, no dependencies beyond the Python standard library. Phase 2 adds a dense
-index and reciprocal-rank fusion.
+gate + phase 2 dense retrieval shipped.** Ingest, cleaning, message-boundary chunking, a BM25
+keyword index, metadata pre-filtering, a deterministic agent-callable query command, a
+background indexer, query/citation/label logging for an implicit-feedback loop (`vdb feedback`,
+`vdb label`, its score-affecting nudge built but shipped off — see "Feedback" below), a
+calibrated `confident`/`uncertain`/`low_confidence` label on every BM25-only result (see
+"Confidence" below), and now a dense (`multilingual-e5-large`) retriever fused with BM25 by
+reciprocal-rank fusion behind `vdb query --hybrid` (see "Dense index" below). The BM25-only path
+still has no model, no vectors, no network, no dependencies beyond the Python standard library —
+`fastembed`/`onnxruntime`/`numpy` are an opt-in extra (`pip install -e '.[dense]'`) needed only
+for `--hybrid` and `vdb dense-index`.
 
 Everything here implements the retrieval-quality study (`vdbqual` report §13) plus the follow-up
 `vdbtray` chunk-granularity experiment that set the split threshold below. Both measured real
@@ -59,8 +62,17 @@ judge, not a verified answer. Read the passages; don't act on the ranking alone.
 
 ## Install
 
-Nothing to install. Python 3.11+ with `sqlite3` compiled with FTS5, which is the
-default.
+Nothing to install for the BM25 path. Python 3.11+ with `sqlite3` compiled with FTS5, which is
+the default.
+
+For `--hybrid` / `vdb dense-index` (phase 2, "Dense index" below), install the optional extra:
+
+```sh
+pip install -e '.[dense]'   # fastembed (ONNX Runtime) + numpy — no PyTorch, no API calls
+```
+
+Everything else (`vdb index`, `vdb query`, `vdb feedback`, `vdb label`, `vdb nudge`, `vdb stats`)
+never imports any of that, so skipping this extra costs nothing on the BM25-only path.
 
 ## Index
 
@@ -86,6 +98,80 @@ Override with `--db` or `$VDB_DB`.
 > The secret filter reduces the exposure; it does not eliminate it (open
 > question O14 leaves its false-negative rate on this material unmeasured).
 
+## Dense index — phase 2
+
+`vdb dense-index` embeds every not-yet-embedded chunk with `multilingual-e5-large` (via
+`fastembed`/ONNX Runtime, the `dense` extra — see "Install") and stores the vectors in
+`chunk_embeddings`, in the same database as everything else. `vdb query --hybrid` then fuses
+this ranking with BM25's by reciprocal-rank fusion (`vdbqual` §11.4's exact measured
+mechanism — see `vdb/retrieve.py`'s `reciprocal_rank_fusion`).
+
+```sh
+python -m vdb dense-index            # embed everything not yet embedded (incremental)
+python -m vdb dense-index --rebuild  # clear chunk_embeddings and start over (e.g. after a model change)
+python -m vdb dense-index --status   # report embedding coverage, embed nothing
+```
+
+**Why `multilingual-e5-large`:** the only model in the whole research line that beats BM25
+alone on any metric once fused (`vdbqual` §10.3: +0.033 MRR over BM25 alone, CI
+[+0.004,+0.063]), and the only one whose ranking advantage becomes a real recall gain once
+results are cut to the top 3-5 (`vdbaccuracy` §4: MACRO recall@3 +0.062, CI [+0.006,+0.119],
+concentrated in query family Q — genuine question → its actual answer). Decided in
+`data/decisions/vdbqual-decision-embedding-model-cost.md` (outside this repo), approved
+2026-08-20.
+
+**Why brute-force numpy over `sqlite-vec`:** `vdbscout`'s "storage/index options" finding is
+that both are fast and cheap at this corpus's scale (`sqlite-vec`: flat ~29-30 MB RAM
+regardless of corpus size, ~22-250ms p50 depending on scale; brute force: comparable or
+faster, with no persistence/filtering story of its own to build). At this corpus's size,
+`sqlite-vec` buys ANN semantics this corpus is too small to need, at the cost of a compiled
+SQLite extension this stdlib-first project would otherwise avoid — so vectors are plain
+BLOBs in `chunk_embeddings`, scanned with `numpy` at query time (`DenseRetriever`,
+`vdb/retrieve.py`).
+
+**This is a real, many-hour job on the full corpus — it is not run synchronously by anything
+in this repo.** Kick it off detached and let it run in the background:
+
+```sh
+nohup python -m vdb dense-index > "$XDG_DATA_HOME/vdb/dense-index.log" 2>&1 &
+disown
+echo $! > "$XDG_DATA_HOME/vdb/dense-index.pid"
+```
+
+Check on it any time without disturbing it:
+
+```sh
+tail -f "$XDG_DATA_HOME/vdb/dense-index.log"     # progress, one line per batch
+python -m vdb dense-index --status --json        # embedded / chunks / remaining / complete
+```
+
+**Cost, measured on this task's own hardware (37 GiB RAM, 12 cores) — treat the hour figure as
+a rough order of magnitude, not a commitment:**
+
+| what | value |
+|---|---|
+| model footprint (resident) | ~1.5 GB measured this run (`vdbqual` §10.3's own figure: ~2.24 GB — both comfortably under this box's 37 GiB) |
+| model download | ~2.24 GB, one-time, on first use |
+| chunks in the corpus right now | 56,096 (re-derived today via `vdb index`; **smaller** than the 74,798 `vdbaccuracy` §4.4 extrapolated from — the corpus did not simply grow since that report, so that report's hour estimate does not carry over unmodified) |
+| measured throughput, this run | **0.90 chunks/s** (200-chunk real-corpus sample, batch size 32, mean 449 chars/chunk) |
+| extrapolated wall-clock at that rate | **~17.3 hours [ESTIMATED, noisy]** |
+
+That 0.90 chunks/s is noticeably slower than `vdbaccuracy` §4.4's own noisy 2.89 chunks/s
+figure, and the likely reason is the same one that report already flagged: **this machine was
+not quiet during either measurement.** At kickoff time this box was running under load average
+~4.3 across 12 cores (12+ other concurrent sessions on the same host) — a genuinely idle
+re-measurement was not practical to arrange for this task, so the number above is reported as
+what was actually observed, not adjusted upward to look better. Do not treat either the rate or
+the resulting hour estimate as precise; both chunks/s numbers on record for this model (2.89
+and 0.90) share the same root cause of noise (shared CPU, plus a `fastembed` internal change to
+this model's pooling behaviour — surfaced again in this run's own `UserWarning`), and the honest
+takeaway is "several hours to the better part of a day, depending heavily on what else the
+machine is doing," not either single number.
+
+**Real-corpus status at the time this shipped:** the background job described above was started
+before this PR was opened; it is not fully embedded at merge time. See the PR description for
+today's actual PID/log path and current coverage.
+
 ## Query — for an agent to call
 
 ```sh
@@ -94,6 +180,7 @@ python -m vdb query "flaky websocket reconnect" -k 5 --full
 python -m vdb query "auth redesign" --project firstmate --since 2026-06-01 --until 2026-07-01
 python -m vdb query "auth redesign" --session a3e6769e --role user
 python -m vdb query "auth redesign" --json          # for programmatic callers — use this
+python -m vdb query "auth redesign" --hybrid        # BM25 + dense, fused (needs `vdb dense-index`)
 ```
 
 ### Filters — narrow before searching, not after
@@ -128,7 +215,7 @@ this module's whole reason filtering is a `WHERE` clause and not a second-pass r
 
 ```json
 {
-  "query_id": 42, "query": "...", "k_requested": 10, "n_hits": 7,
+  "query_id": 42, "query": "...", "retriever": "bm25", "k_requested": 10, "n_hits": 7,
   "margin": 12.4, "weak_signal": false,
   "confidence": "uncertain", "confidence_note": "measured hit rate 45% (95% CI 35-54%) - ...",
   "nudge_applied": false,
@@ -141,6 +228,10 @@ this module's whole reason filtering is a `WHERE` clause and not a second-pass r
   "citation_reminder": "citation is expected after every query you act on: ..."
 }
 ```
+
+`"retriever"` is `"bm25"` unless `--hybrid` was passed, in which case it's `"hybrid"` and
+`"confidence"` is `"uncalibrated"` instead of one of the three calibrated bands — see "Confidence"
+below for why.
 
 Every hit carries project, role, timestamp, session id and source file — enough to cite the
 passage or go read the surrounding session deliberately. `query_id` is what you pass to `vdb
@@ -231,6 +322,18 @@ right (28% of the time, on this measurement); a `confident` result is still wron
 not the other direction of surprise. Do not build automation that acts only on `confident` results
 or silently discards `low_confidence` ones without a human or agent actually reading them first.
 
+**`--hybrid` results are `uncalibrated`, not one of the three bands above — a deliberate phase 2
+design decision, not an oversight.** The table above was fit on raw BM25 margins specifically
+(query families Q and C, `vdb/retrieve.py`'s `CONFIDENCE_LOW_MARGIN`/`CONFIDENCE_HIGH_MARGIN`
+docstring). Once a ranking comes from `DenseRetriever` or `HybridRetriever`, `margin` is a
+different quantity — a cosine-similarity gap or a reciprocal-rank-fusion score gap, not a BM25
+score gap — and reusing the BM25-fit thresholds on it would silently mislabel confidence with
+numbers that were never validated for that case. That is exactly the overselling-reliability
+failure this gate exists to prevent, so `Result.confidence` returns `retrieve.UNCALIBRATED`
+(`"uncalibrated"`) for any non-BM25-only ranking instead of guessing. **Recalibrating the gate for
+hybrid mode is follow-up work, not shipped here** — see "Dense index" below for why this task
+scoped it out rather than let it balloon into a second calibration study.
+
 ## Feedback — how this index learns from real use
 
 Implements `data/vdbfeedback/report.md` (outside this repo). The short version: **cite
@@ -282,6 +385,15 @@ retrieval changes.**
    `--chunk <id>` to inspect one chunk's own gate) reports live status;
    `scripts/nudge-regression-check.md` documents the regression check. See `AGENTS.md`
    before ever touching this.
+5. **The nudge is BM25-only — phase 2's `DenseRetriever` never reads `chunk_feedback`, and
+   that's a deliberate decision, not an oversight.** Every label this loop has ever collected
+   was collected against BM25-only rankings; extending an already-experimental, still-off
+   mechanism to a brand-new retriever at the same time would compound two unvalidated things
+   at once. `HybridRetriever` doesn't add a nudge of its own either — when the global gate above
+   is active, BM25's own nudge still shapes the BM25 half of a `--hybrid` fusion (because that
+   half comes from an ordinary `BM25Retriever.search()` call), it just never touches the dense
+   half. Revisiting this — collecting feedback against hybrid rankings, then deciding whether to
+   nudge the dense side too — is follow-up work, not scoped into phase 2.
 
 Attribution to "your own session" uses `$CLAUDE_CODE_SESSION_ID` (confirmed to match the
 transcript's own filename/`sessionId` — see `AGENTS.md`), captured automatically by
@@ -320,8 +432,12 @@ its own, nothing that needs babysitting beyond what `systemctl --user status vdb
 python -m unittest discover -s tests -t .
 ```
 
-All fixtures are constructed in `tests/fixture.py`. No real transcript content
-is committed to this repository, ever.
+All fixtures are constructed in `tests/fixture.py`. No real transcript content is committed to
+this repository, ever. `tests/test_dense.py`'s `FakeEmbedder` gives dense/hybrid/fusion logic
+full coverage without the real ~2.24GB model or `numpy` installed; the handful of tests that do
+exercise `DenseRetriever`/`HybridRetriever.search()` (which lazily `import numpy`) skip
+themselves automatically when `numpy` isn't importable, so the base suite stays green on a
+stdlib-only install and the full suite runs once the `dense` extra is installed.
 
 ## Layout
 
@@ -331,22 +447,37 @@ is committed to this repository, ever.
 | `vdb/clean.py` | harness-block stripping and boilerplate trimming |
 | `vdb/secrets.py` | the secret-shaped-string filter |
 | `vdb/chunk.py` | message-boundary chunking |
-| `vdb/store.py` | SQLite chunk store, FTS5 index, incremental update |
-| `vdb/retrieve.py` | BM25 query path, metadata filters, `Hit`/`Result` shapes, the margin/weak-signal diagnostic, the calibrated confidence gate, the (gated-off) score nudge |
+| `vdb/store.py` | SQLite chunk store, FTS5 index, incremental update, `chunk_embeddings` schema |
+| `vdb/retrieve.py` | BM25/dense/hybrid query paths, shared metadata filters, `Hit`/`Result` shapes, reciprocal-rank fusion, the margin/weak-signal diagnostic, the calibrated (BM25-only) confidence gate, the (gated-off, BM25-only) score nudge |
+| `vdb/dense.py` | the `multilingual-e5-large` embedder (`fastembed`, lazy import), dense index build/coverage, vector packing |
 | `vdb/feedback.py` | the background label-extraction pass (`vdb label`): heuristic confirm/correction classification, boilerplate-aware transcript scanning |
-| `vdb/cli.py` | `index` / `query` / `feedback` / `label` / `nudge` / `stats` / `boilerplate`; deterministic output and exit codes for an agent caller |
-| `systemd/`, `scripts/install-timer.sh`, `scripts/uninstall-timer.sh` | the background indexer + label pass (two systemd `--user` timers) |
+| `vdb/cli.py` | `index` / `dense-index` / `query` (`--hybrid`) / `feedback` / `label` / `nudge` / `stats` / `boilerplate`; deterministic output and exit codes for an agent caller |
+| `systemd/`, `scripts/install-timer.sh`, `scripts/uninstall-timer.sh` | the background indexer + label pass (two systemd `--user` timers) — BM25 only; the dense index is not on a timer, see "Dense index" |
 | `scripts/nudge-regression-check.md` | the §6.2c procedure to run before ever flipping the score nudge on |
 
-## Phase 2
+## Phase 2 — shipped
 
-A dense index (`bge-small-en-v1.5` to start) fused with BM25 by reciprocal-rank
-fusion — the only configuration measured to beat BM25 alone, and the one that
-degrades most slowly as the corpus grows (§12 finding 4, §11.7). The seam for it
-is small on purpose: `chunks.id` is a stable integer key a vector file can
-address by row, and `retrieve.BM25Retriever.search()` is the shape a second
-retriever has to match so two ranked lists can be fused. There is no plugin
-architecture here for one future retriever.
+A dense index (`multilingual-e5-large`, "Dense index" above) fused with BM25 by
+reciprocal-rank fusion (`vdbqual` §11.4's exact measured mechanism, RRF k=60) behind
+`vdb query --hybrid` — the only configuration measured to beat BM25 alone on any metric once
+fused (§10.3), and the one whose ranking advantage becomes a measured recall gain once cut to
+the top 3-5 (`vdbaccuracy` §4). The seam stayed exactly as small as phase 1 left it:
+`chunks.id` is the vector index's own key too (`chunk_embeddings`, `vdb/store.py`), and
+`DenseRetriever`/`HybridRetriever` satisfy the same `Hit`/`Result` shape `BM25Retriever`
+always has.
 
-Not planned, and measured rather than assumed: **no reranker** (it made the best
-configuration worse, §11.4) and **no automatic context injection** (§13.2).
+Not shipped, and measured rather than assumed: **no reranker** (it made the best configuration
+worse, §11.4) and **no automatic context injection** (§13.2, unchanged by phase 2).
+
+**Two decisions made explicitly rather than defaulted** (full reasoning in "Feedback" and
+"Confidence" above): the feedback nudge stays BM25-only, and `--hybrid` confidence is
+`uncalibrated`, never the BM25-fit bands reused on a different score shape.
+
+**Follow-up work, not scoped into this task:**
+- Recalibrate the confidence gate for hybrid-mode margins (needs its own bounded study, same
+  shape as the original `vdbconfidence` calibration, but against RRF-fused margins).
+- Revisit whether the feedback nudge should ever extend to the dense side, once this loop has
+  actually collected labels against hybrid rankings (it hasn't yet — every label on record was
+  collected against BM25-only rankings).
+- Finish and verify the real-corpus dense index build (see "Dense index" above for how to check
+  on it) once it completes.

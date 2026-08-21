@@ -1,5 +1,5 @@
-"""Command line: `vdb index`, `vdb query`, `vdb feedback`, `vdb label`, `vdb
-nudge`, `vdb stats`, `vdb boilerplate`.
+"""Command line: `vdb index`, `vdb dense-index`, `vdb query` (`--hybrid` for phase 2's
+BM25+dense fusion), `vdb feedback`, `vdb label`, `vdb nudge`, `vdb stats`, `vdb boilerplate`.
 
 The primary caller is an agent, not a human at a terminal - so `query --json`
 output is deterministic and machine-parseable, and exit codes are stable:
@@ -84,6 +84,52 @@ def cmd_index(args) -> int:
     return 0
 
 
+def cmd_dense_index(args) -> int:
+    """Build/update the dense (`multilingual-e5-large`) index (`vdb/dense.py`).
+
+    A separate, much more expensive command from `vdb index` on purpose - this needs
+    `fastembed`/`onnxruntime` (the `dense` extra, `pip install -e '.[dense]'`) and embeds
+    every not-yet-embedded chunk, which is a many-hour job on the full corpus (README "Dense
+    index" has the real command and how to run it detached in the background). `--status`
+    reports coverage without embedding anything, so a background run can be checked on
+    cheaply.
+    """
+    from . import dense as dense_mod
+
+    conn = store.connect(args.db)
+    if args.status:
+        cov = dense_mod.coverage(conn)
+        if args.json:
+            print(json.dumps(cov, indent=2))
+        else:
+            print(
+                f"model: {cov['model']}\n"
+                f"embedded {_fmt_int(cov['embedded'])} / {_fmt_int(cov['chunks'])} chunks "
+                f"({_fmt_int(cov['remaining'])} remaining)\n"
+                f"complete: {cov['complete']}"
+            )
+        return 0
+
+    def progress(embedded: int, total: int) -> None:
+        if not args.quiet:
+            print(f"  [{embedded:>6}/{total}] embedded", file=sys.stderr)
+
+    try:
+        st = dense_mod.build_index(
+            conn, rebuild=args.rebuild, batch_size=args.batch_size, progress=progress
+        )
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps({"dense_index": st.as_dict(), "coverage": dense_mod.coverage(conn)}, indent=2))
+        return 0
+    print(f"embedded {_fmt_int(st.embedded)} / {_fmt_int(st.candidates)} candidate chunks")
+    cov = dense_mod.coverage(conn)
+    print(f"dense index now: {_fmt_int(cov['embedded'])} / {_fmt_int(cov['chunks'])} chunks embedded")
+    return 0
+
+
 def cmd_query(args) -> int:
     db = Path(args.db)
     if not db.exists():
@@ -96,8 +142,22 @@ def cmd_query(args) -> int:
     if store.stats(conn)["chunks"] == 0:
         print("the index is empty — run `python -m vdb index` first", file=sys.stderr)
         return 2
+
+    if args.hybrid:
+        from . import dense as dense_mod
+
+        if dense_mod.coverage(conn)["embedded"] == 0:
+            print(
+                "warning: the dense index is empty — `--hybrid` results are effectively "
+                "BM25-only until `vdb dense-index` has run (see README 'Dense index')",
+                file=sys.stderr,
+            )
+        retriever = retrieve.HybridRetriever(conn)
+    else:
+        retriever = retrieve.BM25Retriever(conn)
+
     try:
-        result = retrieve.BM25Retriever(conn).search(
+        result = retriever.search(
             args.question,
             k=args.k,
             project=args.project,
@@ -108,6 +168,9 @@ def cmd_query(args) -> int:
             include_sidechain=not args.no_sidechain,
         )
     except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         return 2
 
@@ -122,6 +185,7 @@ def cmd_query(args) -> int:
             "since": args.since,
             "until": args.until,
             "include_sidechain": not args.no_sidechain,
+            "retriever": result.retriever,
         },
         k_requested=result.k_requested,
         hit_chunk_ids=[h.chunk_id for h in result.hits],
@@ -147,6 +211,7 @@ def cmd_query(args) -> int:
                 {
                     "query_id": query_id,
                     "query": result.query,
+                    "retriever": result.retriever,
                     "k_requested": result.k_requested,
                     "n_hits": len(result.hits),
                     "margin": result.margin,
@@ -168,6 +233,8 @@ def cmd_query(args) -> int:
     if not result.hits:
         print("no passages matched — this may mean the index has nothing on this, "
               "not that nothing on this exists (this system cannot tell the two apart).")
+        if result.retriever != "bm25":
+            print(f"retriever: {result.retriever}")
         print(f"\nconfidence: {result.confidence}  — {retrieve.CONFIDENCE_EXPLANATION[result.confidence]}")
         print(f"\nquery_id: {query_id}  — {citation_reminder}")
         return 1
@@ -182,6 +249,8 @@ def cmd_query(args) -> int:
         print(textwrap.indent(body, "    "))
     if result.margin is not None:
         print(f"\nrank1–rank{min(10, len(result.hits))} margin: {result.margin}")
+    if result.retriever != "bm25":
+        print(f"retriever: {result.retriever}")
     print(f"confidence: {result.confidence}  — {retrieve.CONFIDENCE_EXPLANATION[result.confidence]}")
     if result.weak_signal:
         print(
@@ -335,17 +404,34 @@ def cmd_boilerplate(args) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="vdb",
-        description="Local BM25 retrieval over your own Claude Code history (phase 1).",
+        description="Local BM25 + dense retrieval over your own Claude Code history.",
     )
     p.add_argument("--db", default=str(store.DEFAULT_DB), help="index database path")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    i = sub.add_parser("index", help="build or incrementally update the index")
+    i = sub.add_parser("index", help="build or incrementally update the BM25 index")
     i.add_argument("--root", default=str(ingest_mod.DEFAULT_ROOT), help="corpus root (read-only)")
     i.add_argument("--rebuild", action="store_true", help="discard the index and start over")
     i.add_argument("--json", action="store_true")
     i.add_argument("-q", "--quiet", action="store_true", help="no per-file progress")
     i.set_defaults(func=cmd_index)
+
+    di = sub.add_parser(
+        "dense-index",
+        help="build or incrementally update the dense (multilingual-e5-large) index — "
+        "needs the 'dense' extra (pip install -e '.[dense]'); a many-hour job on the full "
+        "corpus, see README 'Dense index'",
+    )
+    di.add_argument("--rebuild", action="store_true", help="discard dense embeddings and start over")
+    di.add_argument(
+        "--batch-size", type=int, default=32, help="chunks embedded per model call (default 32)"
+    )
+    di.add_argument(
+        "--status", action="store_true", help="report embedding coverage and exit, embed nothing"
+    )
+    di.add_argument("--json", action="store_true")
+    di.add_argument("-q", "--quiet", action="store_true", help="no per-batch progress")
+    di.set_defaults(func=cmd_dense_index)
 
     q = sub.add_parser(
         "query",
@@ -366,6 +452,14 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--since", help="ISO timestamp lower bound, e.g. 2026-01-01")
     q.add_argument("--until", help="ISO timestamp upper bound, e.g. 2026-06-30")
     q.add_argument("--no-sidechain", action="store_true", help="exclude subagent transcripts")
+    q.add_argument(
+        "--hybrid",
+        action="store_true",
+        help="fuse BM25 with the dense (multilingual-e5-large) retriever via reciprocal-rank "
+        "fusion, instead of BM25 alone — needs `vdb dense-index` to have run; confidence is "
+        "reported as 'uncalibrated' for hybrid results, not the BM25-calibrated bands (see "
+        "README 'Confidence')",
+    )
     q.add_argument("--full", action="store_true", help="print whole passages, not excerpts")
     q.add_argument("--width", type=int, default=400, help="excerpt width (default 400)")
     q.add_argument(

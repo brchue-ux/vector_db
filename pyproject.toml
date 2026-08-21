@@ -7,7 +7,16 @@ name = "vdb"
 version = "0.1.0"
 description = "Local BM25 retrieval over your own Claude Code history"
 requires-python = ">=3.11"
-dependencies = []          # phase 1 is stdlib-only, on purpose
+dependencies = []          # the BM25 path (query/index without --hybrid) stays stdlib-only
+
+# Phase 2 dense retrieval only (`vdb/dense.py`, `vdb dense-index`, `vdb query --hybrid`).
+# Nothing else in this repo imports fastembed/onnxruntime/numpy at module load time - they
+# are imported lazily, only from the dense-specific code paths - so plain `vdb query`/`vdb
+# index` never need this extra installed. Install with `pip install -e '.[dense]'`.
+# fastembed runs multilingual-e5-large locally via ONNX Runtime (no PyTorch, no API calls);
+# numpy is the brute-force cosine-search math (README "Storage" for why over sqlite-vec).
+[project.optional-dependencies]
+dense = ["fastembed>=0.8,<0.9", "numpy>=1.26"]
 
 [project.scripts]
 vdb = "vdb.cli:main"

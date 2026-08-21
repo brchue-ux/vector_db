@@ -5,10 +5,11 @@ b=0.75 - the same parameterisation the study measured (§B.5) - it is in the
 Python standard library, it needs no model and no network, and it gives
 incremental insert/delete for free. Phase 1 therefore has zero dependencies.
 
-Phase 2 seam (dense index + reciprocal-rank fusion) - deliberately minimal:
-`chunks.id` is a stable integer key that a vector file can address by row, and
-`retrieve.Retriever` is the one shape a second retriever has to satisfy. There
-is no plugin machinery here for a single future retriever.
+Phase 2 (dense index + reciprocal-rank fusion, `vdb/dense.py` + `vdb/retrieve.py`) reuses
+`chunks.id` as the vector index's own key: `chunk_embeddings` (below) is one row per chunk,
+addressed by that same stable integer, so the dense side never needs its own id scheme or a
+separate vector file. There is no plugin machinery here for a second future retriever - the
+seam was, and remains, exactly `retrieve.BM25Retriever.search()`'s `Result`/`Hit` shape.
 
 The index contains the captain's prose. It is exactly as sensitive as the
 transcripts (F9), so the database file is created 0600 inside a 0700 directory.
@@ -152,6 +153,22 @@ CREATE TABLE IF NOT EXISTS chunk_feedback (
     negative_n   INTEGER NOT NULL DEFAULT 0,
     last_updated TEXT
 );
+
+-- Phase 2 dense index (`vdb/dense.py`). One row per chunk per embedding model,
+-- addressed by the same stable `chunks.id` the BM25 side already uses - no
+-- separate vector file (report `vdbscout` "storage/index options": brute-force
+-- over SQLite BLOBs is comparable-or-faster than sqlite-vec at this corpus's
+-- scale, with no extra compiled dependency). `vector` is a packed little-endian
+-- float32 array (`dense.pack_vector`/`unpack_vector`), L2-normalized at write
+-- time so cosine similarity is a plain dot product at search time. `model`
+-- exists so a future model change doesn't have to guess which rows are stale.
+CREATE TABLE IF NOT EXISTS chunk_embeddings (
+    chunk_id     INTEGER PRIMARY KEY REFERENCES chunks(id),
+    model        TEXT NOT NULL,
+    dim          INTEGER NOT NULL,
+    vector       BLOB NOT NULL,
+    indexed_at   TEXT NOT NULL
+);
 """
 
 # The GLOBAL half of the nudge gate: `nudge_active()` stays False below this
@@ -256,10 +273,14 @@ def connect(db_path: Path = DEFAULT_DB) -> sqlite3.Connection:
 
 
 def reset(conn: sqlite3.Connection) -> None:
-    """Drop every indexed artefact, keeping the schema."""
+    """Drop every indexed artefact, keeping the schema.
+
+    Clears `chunk_embeddings` too - `chunks.id` is reassigned on a rebuild, so leaving old
+    embeddings behind would silently attach a stale vector to whatever chunk reuses that id.
+    """
     conn.executescript(
-        "DELETE FROM chunks_fts; DELETE FROM chunks; DELETE FROM file_line;"
-        " DELETE FROM line_freq; DELETE FROM files;"
+        "DELETE FROM chunks_fts; DELETE FROM chunk_embeddings; DELETE FROM chunks;"
+        " DELETE FROM file_line; DELETE FROM line_freq; DELETE FROM files;"
     )
     conn.commit()
 
@@ -272,6 +293,10 @@ def boilerplate_lines(conn: sqlite3.Connection, threshold: int = BOILERPLATE_MIN
 def _forget_file(conn: sqlite3.Connection, file_id: int) -> None:
     conn.execute(
         "DELETE FROM chunks_fts WHERE rowid IN (SELECT id FROM chunks WHERE file_id = ?)",
+        (file_id,),
+    )
+    conn.execute(
+        "DELETE FROM chunk_embeddings WHERE chunk_id IN (SELECT id FROM chunks WHERE file_id = ?)",
         (file_id,),
     )
     conn.execute("DELETE FROM chunks WHERE file_id = ?", (file_id,))
@@ -457,6 +482,7 @@ def stats(conn: sqlite3.Connection) -> dict:
                        or [None])[0],
         "root": (conn.execute("SELECT value FROM meta WHERE key='root'").fetchone() or [None])[0],
         "citation_compliance": citation_compliance(conn),
+        "dense_embedded": one("SELECT COUNT(*) FROM chunk_embeddings"),
     }
 
 
