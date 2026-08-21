@@ -339,7 +339,17 @@ def build_parser() -> argparse.ArgumentParser:
     i.add_argument("-q", "--quiet", action="store_true", help="no per-file progress")
     i.set_defaults(func=cmd_index)
 
-    q = sub.add_parser("query", help="ask the index a question")
+    q = sub.add_parser(
+        "query",
+        help="ask the index a question",
+        epilog=(
+            "Filter guidance: narrowing by project is close to a universal win. A rough or "
+            "guessed date window helps when a query is naturally time-scoped, but can hurt "
+            "cross-session 'have we discussed this before' questions because their answers "
+            "are displaced in time. If you are not sure which kind of question you are "
+            "answering, do not use --since/--until by default."
+        ),
+    )
     q.add_argument("question")
     q.add_argument("-k", type=int, default=10, help="number of passages (default 10)")
     q.add_argument("--project", help="restrict to projects whose directory name contains this")
