@@ -8,9 +8,9 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 
 Local retrieval over the captain's own Claude Code history — **for an agent to call, not a human
 to search** (`vdb query`; no UI is planned, ever). Ingest, cleaning, message-boundary chunking,
-BM25, metadata pre-filtering, a background indexer, and implicit-feedback logging/citation/label
-extraction are built; see `README.md` for what it does and how to run it, and `vdb/*.py` module
-docstrings for why each rule exists.
+BM25, metadata pre-filtering, a background indexer, implicit-feedback logging/citation/label
+extraction, and a calibrated confidence gate on every result are built; see `README.md` for what
+it does and how to run it, and `vdb/*.py` module docstrings for why each rule exists.
 
 ## The implicit-feedback learning loop
 
@@ -75,6 +75,12 @@ and the intuitive alternative lost:**
   thresholded into a verdict. See `vdb/retrieve.py`'s docstring before citing an AUC number for
   this system — the dense-model figures do not transfer to BM25's unbounded score.
 - **No reranker.** Measured: it made the best configuration worse.
+- **Confidence gate cut points (margin 75.0 / 126.0, `vdb/retrieve.py:CONFIDENCE_LOW_MARGIN`/
+  `CONFIDENCE_HIGH_MARGIN`) are fit on query families Q and C only, not the whole corpus of query
+  shapes.** Pooling all four families inverts the signal (family T's session-level gold lets a
+  genuine hit have a flat score curve, which Simpson's-paradoxes the pooled AUC negative — see that
+  constant's docstring for the full measurement). Don't re-tune these by eyeballing hit rates or
+  widen the calibration population to "more data" without re-checking this confound first.
 - **Templated messages are trimmed, never deleted.** Deleting them collapses
   session-topic recall.
 - Prose only; tool I/O stays out (size, not content, is the reason).

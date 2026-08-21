@@ -6,13 +6,14 @@ context, and gets back a handful of short, provenance-tagged passages instead of
 conversation. There is deliberately no UI and no visual app here, and none is planned — the
 consumer is an agent, not a human doing his own searching.
 
-**Status: phase 1 + the agent-facing tool + implicit-feedback logging shipped.** Ingest,
-cleaning, message-boundary chunking, a BM25 keyword index, metadata pre-filtering, a
-deterministic agent-callable query command, a background indexer, and query/citation/label
-logging for an implicit-feedback loop (`vdb feedback`, `vdb label`) — with its
-score-affecting nudge built but shipped off (see "Feedback" below). No model, no vectors, no
-network, no dependencies beyond the Python standard library. Phase 2 adds a dense index and
-reciprocal-rank fusion.
+**Status: phase 1 + the agent-facing tool + implicit-feedback logging + a calibrated confidence
+gate shipped.** Ingest, cleaning, message-boundary chunking, a BM25 keyword index, metadata
+pre-filtering, a deterministic agent-callable query command, a background indexer, query/
+citation/label logging for an implicit-feedback loop (`vdb feedback`, `vdb label`, its
+score-affecting nudge built but shipped off — see "Feedback" below), and a calibrated
+`confident`/`uncertain`/`low_confidence` label on every result (see "Confidence" below). No model,
+no vectors, no network, no dependencies beyond the Python standard library. Phase 2 adds a dense
+index and reciprocal-rank fusion.
 
 Everything here implements the retrieval-quality study (`vdbqual` report §13) plus the follow-up
 `vdbtray` chunk-granularity experiment that set the split threshold below. Both measured real
@@ -129,7 +130,9 @@ this module's whole reason filtering is a `WHERE` clause and not a second-pass r
 ```json
 {
   "query_id": 42, "query": "...", "k_requested": 10, "n_hits": 7,
-  "margin": 12.4, "weak_signal": false, "nudge_applied": false,
+  "margin": 12.4, "weak_signal": false,
+  "confidence": "uncertain", "confidence_note": "measured hit rate 45% (95% CI 35-54%) - ...",
+  "nudge_applied": false,
   "hits": [ {"chunk_id": 1, "rank": 1, "score": 0.0, "text": "...",
              "session_id": "...", "project": "...", "role": "...", "ts": "...",
              "part": 0, "n_parts": 1, "source": "...", "is_sidechain": false }, ... ],
@@ -166,14 +169,66 @@ exactly why this is a command an agent calls, never a hook that runs automatical
 `margin` (the score gap between rank 1 and rank 10, or the last hit if fewer) carries more signal
 than the raw score — but re-measured for this system specifically, that signal is real and modest
 (AUC 0.645, 95% CI [0.598, 0.690]), not the strong 0.724 a prior study found for a dense retriever
-on a different score scale. **It is deliberately not thresholded into a verdict.** Instead,
-`weak_signal` is a calibration-free structural flag — true when there are fewer than 2 hits (the
-margin is undefined) or fewer hits than requested (the index has thin coverage for this query) —
-and `false` otherwise. It does *not* mean "trust this"; it only means "there was enough returned
-material to have an opinion at all." Reading the actual passages, not just the score or the flag,
-is still the caller's job. Do not build a numeric confidence gate on top of `margin` without
-re-measuring it (O13 is still open) — the honest answer today is that a good gate does not exist
-yet.
+on a different score scale. `weak_signal` is a calibration-free structural flag — true when there
+are fewer than 2 hits (the margin is undefined) or fewer hits than requested (the index has thin
+coverage for this query) — and `false` otherwise. It does *not* mean "trust this"; it only means
+"there was enough returned material to have an opinion at all." See "Confidence" below for the
+calibrated label built on top of `margin`.
+
+## Confidence — a calibrated, still-noisy "does this look like a hit" gate
+
+`confidence` (`retrieve.confidence_band()`, one of `confident` / `uncertain` / `low_confidence`)
+answers `vdbqual` O13: instead of thresholding the raw `margin` (rejected above — AUC 0.645 isn't
+strong enough for a hard cutoff), it compares *this query's* score shape against calibrated
+hit-shaped and miss-shaped populations, the way Haystack's extractive reader frames "no answer" as
+a hypothesis competing against the observed score distribution rather than a fixed bar. It labels
+the existing ranking; it does not change which passages are returned or their order, and it does
+not trigger any automatic search or context injection (still §13.2's standing rule).
+
+**How it was calibrated.** vdbqual Appendix B's four query families (M/Q/C/T — memory-card recall,
+question-answered-in-session, cross-session recurrence, session-topic recall) were rebuilt against
+the *live* corpus at the shipped `msg1000` BM25 config and scored: 565 queries, pooled hit@10 rate
+68.5%. Several shape descriptors were compared by AUC before picking one, not a rubber stamp of
+`margin`: the rank1–rank2 gap, that gap normalised by the top score, a normalised score-decay-curve
+area, and the rank-1 z-score against the rank2–10 tail (this last one scored *worse than chance*,
+0.462). Plain `margin` won; nothing tried beat it.
+
+Naively pooling all four families' AUC inverts the sign (0.385 — margin appearing to predict a
+*miss*). Diagnosed, not ignored: family M is always a hit (no negative examples); family T's gold
+is session-level ("any chunk from this session counts"), generous enough that a genuine hit does
+not need a peaked score curve, so its typical *hit* margin sits below families Q/C's typical *miss*
+margin — a real Simpson's-paradox confound when the four are mixed, even though the relationship is
+positive within every family individually (T's own within-family AUC is 0.850). **The gate is
+therefore calibrated on families Q and C only** (n=288, hit rate 43.8%) — the two families whose
+gold means "this specific passage is the answer" rather than "something from the right session
+showed up" (`vdbqual` §2.2 already names these the ones to trust when families disagree).
+AUC(margin) on that population = 0.647, 95% CI [0.584, 0.709] — closely matching a prior pooled
+BM25 margin measurement on this corpus (0.645, n=596), which is reassuring given the different
+query samples on a corpus that kept growing between the two measurements.
+
+**Practical consequence of that scoping:** this gate is calibrated on, and most trustworthy for,
+specific-answer-recall-shaped queries ("what did we decide about X", "why did we pick Y"). A broad
+"have we talked about X before" query is closer to family T's shape, where this same margin
+threshold does not carry the same meaning — it was excluded from calibration precisely because it
+doesn't reliably indicate confidence there.
+
+**The three bands, and their own measured hit rate** (terciles of the Q+C margin distribution,
+3,000-resample bootstrap 95% CIs — not round numbers, and not finer than the data supports):
+
+| band | margin | measured hit rate |
+|---|---|---|
+| `low_confidence` | < 75.0 | 28.1%  [18.9%, 37.4%] |
+| `uncertain` | 75.0 – 126.0 | 44.7%  [34.7%, 54.4%] |
+| `confident` | ≥ 126.0 | 58.2%  [48.1%, 67.7%] |
+
+Adjacent bands' intervals overlap — this is a real but noisy signal, the same conclusion the AUC
+gives. **Not a numeric confidence score:** the calibration data doesn't support finer distinctions
+without manufacturing false precision, so three bands is what ships, not a percentage. Even
+`confident` means "better than even odds, not far past it" — 58% is real signal, not certainty.
+**This is not a substitute for reading the passages.** A `low_confidence` result is still sometimes
+right (28% of the time, on this measurement); a `confident` result is still wrong more often than
+not the other direction of surprise. Do not build automation that acts only on `confident` results
+or silently discards `low_confidence` ones without a human or agent actually reading them first.
 
 ## Feedback — how this index learns from real use
 
@@ -276,7 +331,7 @@ is committed to this repository, ever.
 | `vdb/secrets.py` | the secret-shaped-string filter |
 | `vdb/chunk.py` | message-boundary chunking |
 | `vdb/store.py` | SQLite chunk store, FTS5 index, incremental update |
-| `vdb/retrieve.py` | BM25 query path, metadata filters, `Hit`/`Result` shapes, the margin/weak-signal diagnostic, the (gated-off) score nudge |
+| `vdb/retrieve.py` | BM25 query path, metadata filters, `Hit`/`Result` shapes, the margin/weak-signal diagnostic, the calibrated confidence gate, the (gated-off) score nudge |
 | `vdb/feedback.py` | the background label-extraction pass (`vdb label`): heuristic confirm/correction classification, boilerplate-aware transcript scanning |
 | `vdb/cli.py` | `index` / `query` / `feedback` / `label` / `nudge` / `stats` / `boilerplate`; deterministic output and exit codes for an agent caller |
 | `systemd/`, `scripts/install-timer.sh`, `scripts/uninstall-timer.sh` | the background indexer + label pass (two systemd `--user` timers) |
