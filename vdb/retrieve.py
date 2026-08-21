@@ -152,9 +152,11 @@ LOW_CONFIDENCE = "low_confidence"
 # combining populations with different baseline score scales, not a bug in
 # the harness - and it is itself the reason this gate is calibrated on
 # families Q and C only (n=288, hit rate 43.8%): the two families whose gold
-# means "this specific passage is the answer" (vdbqual §2.2 already names
-# these the ones to trust when families disagree), not "something from the
-# right session showed up". AUC(margin) on that population = 0.647, 95% CI
+# means "this specific passage is the answer", not "something from the right
+# session showed up" - vdbqual §2.2 names Q the family it weights most when
+# families disagree, for exactly that specific-passage-gold reason; C's own
+# gold (§2.3) is built the same way even though §2.2 doesn't say so about C
+# by name. AUC(margin) on that population = 0.647, 95% CI
 # [0.584, 0.709] - matching vdbtray's own pooled BM25 margin AUC (0.645,
 # n=596) closely, which is reassuring given the two measurements used
 # different query samples on a corpus that kept growing between them.

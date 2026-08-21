@@ -201,7 +201,9 @@ margin — a real Simpson's-paradox confound when the four are mixed, even thoug
 positive within every family individually (T's own within-family AUC is 0.850). **The gate is
 therefore calibrated on families Q and C only** (n=288, hit rate 43.8%) — the two families whose
 gold means "this specific passage is the answer" rather than "something from the right session
-showed up" (`vdbqual` §2.2 already names these the ones to trust when families disagree).
+showed up". `vdbqual` §2.2 names Q the family it weights most when families disagree, for exactly
+that specific-passage-gold reason; family C's gold (§2.3) is built the same way, even though §2.2
+doesn't say so about C by name.
 AUC(margin) on that population = 0.647, 95% CI [0.584, 0.709] — closely matching a prior pooled
 BM25 margin measurement on this corpus (0.645, n=596), which is reassuring given the different
 query samples on a corpus that kept growing between the two measurements.
